@@ -1,11 +1,13 @@
-# DeepSeek-R1-Distill-Qwen-32B on a single H200 (141 GB).
+# Muse Glimmer 30B (Meta) on a single H200 (141 GB). Needs vLLM >= 0.29.0.
 #
-# bf16 weights take ~62 GiB; at 0.90 utilization that leaves roughly 50 GiB of
-# KV cache (~0.25 MiB/token for this model), i.e. ~200k tokens shared across
-# concurrent requests.
+# BF16 weights take ~56 GiB, plus ~5 GiB for the DFlash drafter. Only 13 of the
+# 52 layers use full attention (with 2 KV heads); the rest use a 2048-token
+# sliding window. KV cache is therefore ~13 KiB per token, so a full 131k-token
+# request needs under 2 GiB, and the ~55 GiB left at 0.90 utilization fits
+# roughly 30 of them at once.
 
 # Hugging Face repo id or local path.
-model: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
+model: meta-models/Muse-Glimmer-30B
 
 # Passed straight to `vllm serve` (see `vllm serve --help`).
 #   key_name: value -> --key-name value
@@ -15,21 +17,39 @@ model: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
 #   null            -> omitted
 # host, port and api_key are managed by the launcher and must not be set here.
 vllm_args:
-  served_model_name: deepseek-r1-distill-qwen-32b   # the `model` name clients send
+  served_model_name: muse-glimmer-30b   # the `model` name clients send
   dtype: bfloat16
   tensor_parallel_size: 1
   gpu_memory_utilization: 0.90
-  # R1 reasoning traces can run to tens of thousands of tokens. 65536 also fits
-  # on an H200 but lowers how many long requests can run at once.
-  max_model_len: 32768
+  max_model_len: 131072
   max_num_seqs: 64
   enable_prefix_caching: true
-  # Moves <think>...</think> into `reasoning_content` on responses.
-  reasoning_parser: deepseek_r1
-  # DeepSeek's recommended sampling defaults for R1; clients can override per request.
+  # Moves the model's reasoning channel into the `reasoning` field on responses.
+  reasoning_parser: muse_glimmer
+  # Turns the model's ATEM tool-call markup into OpenAI `tool_calls`.
+  enable_auto_tool_choice: true
+  tool_call_parser: muse_glimmer
+  # low | medium | high | xhigh. Requests can override it with
+  # "chat_template_kwargs": {"reasoning_strength": "low"}.
+  default_chat_template_kwargs:
+    reasoning_strength: high
+  # Meta's recommended sampling (same as the model's generation_config.json);
+  # clients can override per request.
   override_generation_config:
-    temperature: 0.6
+    temperature: 1.0
     top_p: 0.95
+    top_k: 64
+  # DFlash speculative decoding with Meta's drafter. It drafts 16-token blocks,
+  # i.e. 15 speculative tokens per step. It helps most at low concurrency;
+  # delete this block to turn it off.
+  speculative_config:
+    method: dflash
+    model: meta-models/Muse-Glimmer-30B-assistant
+    num_speculative_tokens: 15
+  # The model accepts images (and video frames). The server downloads any
+  # image URLs clients send; to restrict which hosts it will fetch from:
+  # allowed_media_domains: [upload.wikimedia.org]
+  # limit_mm_per_prompt: {image: 8, video: 0}
   # download_dir: /models   # defaults to the Hugging Face cache (HF_HOME)
 
 # Extra environment variables for the vLLM process.
@@ -44,7 +64,7 @@ server:
   api_key_env: VLLM_API_KEY
   public_paths: [/health]            # exact paths reachable without a key
   allowed_prefixes: [/v1, /health, /version, /tokenize, /detokenize]
-  startup_timeout: 3600  # seconds; the first run downloads ~65 GB of weights
+  startup_timeout: 3600  # seconds; the first run downloads ~65 GB (model + drafter)
   endpoint_file: run/endpoint.json   # URLs + pid written here once ready (null to disable)
 
 tunnel:

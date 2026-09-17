@@ -2,8 +2,10 @@
 
 Serves a Hugging Face model with vLLM through an OpenAI-compatible API. Every
 request (except `GET /health`) needs an API key, and an ngrok tunnel can
-optionally expose the server publicly. The default model is
-`deepseek-ai/DeepSeek-R1-Distill-Qwen-32B`, sized for a single H200.
+optionally expose the server publicly. The default model is Meta's
+[`meta-models/Muse-Glimmer-30B`](https://huggingface.co/meta-models/Muse-Glimmer-30B)
+(an agentic model that accepts text and images and supports tool calling),
+sized for a single H200 and using its DFlash drafter for speculative decoding.
 
 ```
 client ──► [ngrok] ──► gateway :8000  (checks Bearer key on every route)
@@ -22,7 +24,7 @@ would let anyone with the URL use the model. The gateway also forwards only
 | --- | --- |
 | `serve.py` | Launcher: reads the config, starts vLLM, waits for it, starts the gateway, opens the tunnel, cleans everything up on exit |
 | `gateway.py` | API-key reverse proxy (Starlette + httpx, streaming) |
-| `configs/default.yaml` | DeepSeek-R1-Distill-Qwen-32B on one H200 |
+| `configs/default.yaml` | Muse Glimmer 30B on one H200: 131k context, reasoning and tool parsers, DFlash drafter |
 
 ## Setup
 
@@ -30,8 +32,9 @@ would let anyone with the URL use the model. The gateway also forwards only
 pip install -r requirements.txt
 ```
 
-If your container already ships vLLM built for its CUDA/torch version, only
-install `pyyaml` and `pyngrok`. The gateway uses FastAPI/Starlette, uvicorn
+Muse Glimmer needs vLLM 0.29.0 or newer. If your container already ships a
+recent enough vLLM built for its CUDA/torch version, only install `pyyaml` and
+`pyngrok` (`python -c 'import vllm; print(vllm.__version__)'`). The gateway uses FastAPI/Starlette, uvicorn
 and httpx, which vLLM already installs.
 
 Generate an API key once and keep it somewhere safe:
@@ -51,10 +54,14 @@ Options:
 
 ```bash
 python serve.py --config configs/other.yaml
-python serve.py --model deepseek-ai/DeepSeek-R1-Distill-Qwen-14B   # served as deepseek-r1-distill-qwen-14b
+python serve.py --model RedHatAI/Muse-Glimmer-30B-FP8-block   # served as muse-glimmer-30b-fp8-block
 python serve.py --port 9000
 python serve.py --dry-run                        # print the vllm command only
 ```
+
+`--model` only swaps the checkpoint. The parsers and the drafter in the config
+stay, so use it for other Muse Glimmer variants (the FP8 one above is untested
+here) and write a separate config for other model families.
 
 Once vLLM is healthy, the server prints the URLs and writes them to
 `run/endpoint.json` (removed again on shutdown). Stop it with Ctrl+C or
@@ -62,7 +69,8 @@ Once vLLM is healthy, the server prints the URLs and writes them to
 the launcher is killed outright, so a Jupyter kernel restart doesn't leave the
 GPU occupied.
 
-The first start downloads about 65 GB of weights into the Hugging Face cache.
+The first start downloads about 65 GB of weights (model plus drafter) into the
+Hugging Face cache.
 Set `HF_HOME` (or `env.HF_HOME` in the config) to a volume that persists.
 
 ### With ngrok
@@ -111,7 +119,7 @@ Follow progress with `!tail -n 20 run/serve.log`.
 curl https://<your-ngrok-domain>/v1/chat/completions \
   -H "Authorization: Bearer $VLLM_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model": "deepseek-r1-distill-qwen-32b",
+  -d '{"model": "muse-glimmer-30b",
        "messages": [{"role": "user", "content": "What is 17 * 23?"}]}'
 ```
 
@@ -120,21 +128,52 @@ from openai import OpenAI
 
 client = OpenAI(base_url="https://<your-ngrok-domain>/v1", api_key="<your key>")
 resp = client.chat.completions.create(
-    model="deepseek-r1-distill-qwen-32b",
+    model="muse-glimmer-30b",
     messages=[{"role": "user", "content": "What is 17 * 23?"}],
     max_tokens=8192,
+    # low | medium | high | xhigh (the config's default is high)
+    extra_body={"chat_template_kwargs": {"reasoning_strength": "low"}},
 )
 msg = resp.choices[0].message
-print(getattr(msg, "reasoning_content", None))  # the <think> section (reasoning_parser)
-print(msg.content)                               # the final answer
+print(getattr(msg, "reasoning", None))  # the model's reasoning (reasoning_parser)
+print(msg.content)                      # the final answer
 ```
+
+Tool calling uses the standard OpenAI `tools` parameter. The server turns the
+model's own tool-call format into `tool_calls`:
+
+```python
+resp = client.chat.completions.create(
+    model="muse-glimmer-30b",
+    messages=[{"role": "user", "content": "What's the weather in Paris?"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }],
+)
+print(resp.choices[0].message.tool_calls)
+```
+
+Images go in as standard `image_url` content parts (an `https://` URL or a
+`data:image/...;base64,` URI). The server downloads URL images itself. To limit
+which hosts it will fetch from, set `allowed_media_domains` in the config.
 
 Streaming (`stream=True`) goes through the gateway unbuffered. If a client
 disconnects, the gateway closes the upstream request so vLLM stops generating.
 
-DeepSeek recommends putting all instructions in the user message for R1
-distills rather than using a system prompt. The config sets their suggested
-sampling defaults (temperature 0.6, top_p 0.95), and requests can override them.
+The config sets Meta's recommended sampling (temperature 1.0, top_p 0.95,
+top_k 64), and requests can override it. Set reasoning strength with
+`chat_template_kwargs` as shown above, not by writing it into your system
+prompt. The chat template already appends a `Reasoning strength:` line to the
+system message.
 
 ## Config
 
@@ -154,5 +193,7 @@ The API key is never read from the config file. It comes from the environment
 variable named in `server.api_key_env` and is handed to vLLM through its
 environment, so it doesn't appear in `ps` output.
 
-For a smaller GPU, copy the config and change `model`, `served_model_name` and
-`max_model_len`. Larger models can use `tensor_parallel_size` across GPUs.
+For a smaller GPU, copy the config, switch `model` to a quantized Muse Glimmer
+checkpoint, and lower `max_model_len`. You can also delete `speculative_config`
+to save the drafter's ~5 GB. Larger models can use `tensor_parallel_size`
+across GPUs.

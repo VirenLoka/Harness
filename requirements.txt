@@ -1,5 +1,6 @@
 # If your container already ships vLLM (built for its CUDA/torch), keep that
-# install and only add the other packages.
-vllm
+# install and only add the other packages. Muse Glimmer (model, parsers and
+# DFlash drafter) needs vLLM 0.29.0 or newer.
+vllm>=0.29.0
 pyyaml
 pyngrok>=8

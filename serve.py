@@ -41,7 +41,7 @@ DEFAULT_CONFIG = SCRIPT_DIR / "configs" / "default.yaml"
 MIN_KEY_LENGTH = 24
 
 DEFAULTS: dict[str, Any] = {
-    "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+    "model": "meta-models/Muse-Glimmer-30B",
     "vllm_args": {},
     "env": {},
     "server": {
