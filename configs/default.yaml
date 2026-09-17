@@ -1,0 +1,53 @@
+# DeepSeek-R1-Distill-Qwen-32B on a single H200 (141 GB).
+#
+# bf16 weights take ~62 GiB; at 0.90 utilization that leaves roughly 50 GiB of
+# KV cache (~0.25 MiB/token for this model), i.e. ~200k tokens shared across
+# concurrent requests.
+
+# Hugging Face repo id or local path.
+model: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
+
+# Passed straight to `vllm serve` (see `vllm serve --help`).
+#   key_name: value -> --key-name value
+#   true / false    -> --key-name / --no-key-name
+#   [a, b]          -> --key-name a b
+#   {k: v}          -> --key-name '{"k": "v"}'
+#   null            -> omitted
+# host, port and api_key are managed by the launcher and must not be set here.
+vllm_args:
+  served_model_name: deepseek-r1-distill-qwen-32b   # the `model` name clients send
+  dtype: bfloat16
+  tensor_parallel_size: 1
+  gpu_memory_utilization: 0.90
+  # R1 reasoning traces can run to tens of thousands of tokens. 65536 also fits
+  # on an H200 but lowers how many long requests can run at once.
+  max_model_len: 32768
+  max_num_seqs: 64
+  enable_prefix_caching: true
+  # Moves <think>...</think> into `reasoning_content` on responses.
+  reasoning_parser: deepseek_r1
+  # DeepSeek's recommended sampling defaults for R1; clients can override per request.
+  override_generation_config:
+    temperature: 0.6
+    top_p: 0.95
+  # download_dir: /models   # defaults to the Hugging Face cache (HF_HOME)
+
+# Extra environment variables for the vLLM process.
+env: {}
+  # HF_HOME: /workspace/hf-cache
+  # HF_TOKEN comes from your shell environment if you need it.
+
+server:
+  host: 0.0.0.0          # gateway bind address (the key is required on every route)
+  port: 8000             # gateway port; point ngrok / clients here
+  vllm_port: 8001        # vLLM itself, bound to 127.0.0.1 only
+  api_key_env: VLLM_API_KEY
+  public_paths: [/health]            # exact paths reachable without a key
+  allowed_prefixes: [/v1, /health, /version, /tokenize, /detokenize]
+  startup_timeout: 3600  # seconds; the first run downloads ~65 GB of weights
+  endpoint_file: run/endpoint.json   # URLs + pid written here once ready (null to disable)
+
+tunnel:
+  enabled: false         # or pass --tunnel
+  authtoken_env: NGROK_AUTHTOKEN
+  domain: null           # reserved ngrok domain, e.g. my-llm.ngrok.app

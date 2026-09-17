@@ -1,0 +1,5 @@
+# If your container already ships vLLM (built for its CUDA/torch), keep that
+# install and only add the other packages.
+vllm
+pyyaml
+pyngrok>=8
