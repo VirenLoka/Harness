@@ -193,6 +193,38 @@ The API key is never read from the config file. It comes from the environment
 variable named in `server.api_key_env` and is handed to vLLM through its
 environment, so it doesn't appear in `ps` output.
 
+## Quantization
+
+Every key under `vllm_args` becomes a `vllm serve` flag, so vLLM's own
+quantization options (`quantization`, `quantization_config`,
+`kv_cache_dtype`) are set straight from the YAML. There are three ways to use
+them:
+
+- **FP8 at load time:** uncomment `quantization: fp8_per_channel` in
+  `configs/default.yaml`. vLLM converts the BF16 text decoder to FP8 while
+  loading. No separate checkpoint is needed, and the vision encoder and the
+  drafter stay BF16. Weights drop from about 56 GiB to about 32 GiB.
+  `fp8_per_block` and `fp8_per_tensor` also work (the config comments explain
+  the difference).
+- **A pre-quantized checkpoint:** point `model` (or `--model`) at it, for
+  example `RedHatAI/Muse-Glimmer-30B-FP8-block` (untested here), and leave
+  `quantization` unset. vLLM reads the scheme from the checkpoint, and setting
+  both makes vLLM report a conflict.
+- **FP8 KV cache:** `kv_cache_dtype: fp8`, together with
+  `kv_cache_dtype_skip_layers: [sliding_window]` (see the config comments).
+
+Some vLLM schemes don't fit this setup. `mxfp8` needs a Blackwell GPU to
+quantize activations. On an H200 it falls back to weight-only FP8, and `mxfp4`
+may keep activations in BF16.
+`int8_per_channel_weight_only` and `nvfp4_per_token` only quantize
+mixture-of-experts layers, which Muse Glimmer doesn't have, so they would
+change nothing.
+
+Run `python serve.py --dry-run` to confirm the flags, and check output quality
+on your own prompts before switching over.
+
+## Smaller GPUs
+
 For a smaller GPU, copy the config, switch `model` to a quantized Muse Glimmer
 checkpoint, and lower `max_model_len`. You can also delete `speculative_config`
 to save the drafter's ~5 GB. Larger models can use `tensor_parallel_size`

@@ -46,6 +46,26 @@ vllm_args:
     method: dflash
     model: meta-models/Muse-Glimmer-30B-assistant
     num_speculative_tokens: 15
+  # Quantization is off by default: BF16 fits comfortably on an H200. Uncomment
+  # `quantization` to convert the text decoder to FP8 while loading. Weights
+  # shrink from ~56 GiB to ~32 GiB, leaving more room for concurrent requests.
+  # The vision encoder and the drafter stay BF16. Schemes that suit this dense
+  # model on Hopper:
+  #   fp8_per_channel  per-channel weight scales, per-token activation scales
+  #                    (same recipe as llm-compressor's FP8_DYNAMIC)
+  #   fp8_per_block    128x128-block weight scales, 1x128-block activation scales
+  #   fp8_per_tensor   one scale per weight tensor
+  # Leave it unset when `model` is already quantized (e.g.
+  # RedHatAI/Muse-Glimmer-30B-FP8-block); vLLM reads that from the checkpoint.
+  # quantization: fp8_per_channel
+  # Optional: keep matching layers in BF16 (regex over vLLM layer names).
+  # quantization_config:
+  #   ignore: ['re:.*layers\.(0|51)\..*']   # first and last decoder layers
+  # FP8 KV cache: uses uncalibrated scales. The sliding-window layers are the
+  # most sensitive to that and hold at most 2048 tokens each, so skipping them
+  # keeps most of the savings (the 13 full-attention layers hold the rest).
+  # kv_cache_dtype: fp8
+  # kv_cache_dtype_skip_layers: [sliding_window]
   # The model accepts images (and video frames). The server downloads any
   # image URLs clients send; to restrict which hosts it will fetch from:
   # allowed_media_domains: [upload.wikimedia.org]
