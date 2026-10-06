@@ -20,7 +20,12 @@ vllm_args:
   served_model_name: muse-glimmer-30b   # the `model` name clients send
   dtype: bfloat16
   tensor_parallel_size: 1
-  gpu_memory_utilization: 0.90
+  gpu_memory_utilization: 0.95
+  # The model's trained limit. A request fails when prompt + requested output
+  # exceeds it, so a client that always asks for 32768 output tokens cannot
+  # send a prompt longer than 98304. Fix that on the client (see README,
+  # "Context budgeting"); raising this past 131072 means extrapolating beyond
+  # what the model was trained on.
   max_model_len: 131072
   max_num_seqs: 64
   enable_prefix_caching: true
@@ -31,6 +36,7 @@ vllm_args:
   tool_call_parser: muse_glimmer
   # low | medium | high | xhigh. Requests can override it with
   # "chat_template_kwargs": {"reasoning_strength": "low"}.
+  # Lower this to medium if long reasoning traces are eating the output budget.
   default_chat_template_kwargs:
     reasoning_strength: high
   # Meta's recommended sampling (same as the model's generation_config.json);
@@ -57,15 +63,17 @@ vllm_args:
   #   fp8_per_tensor   one scale per weight tensor
   # Leave it unset when `model` is already quantized (e.g.
   # RedHatAI/Muse-Glimmer-30B-FP8-block); vLLM reads that from the checkpoint.
-  # quantization: fp8_per_channel
+  quantization: fp8_per_channel
   # Optional: keep matching layers in BF16 (regex over vLLM layer names).
   # quantization_config:
   #   ignore: ['re:.*layers\.(0|51)\..*']   # first and last decoder layers
   # FP8 KV cache: uses uncalibrated scales. The sliding-window layers are the
   # most sensitive to that and hold at most 2048 tokens each, so skipping them
   # keeps most of the savings (the 13 full-attention layers hold the rest).
-  # kv_cache_dtype: fp8
-  # kv_cache_dtype_skip_layers: [sliding_window]
+  # `auto` keeps the KV cache unquantized; skip_layers only takes effect once
+  # kv_cache_dtype is fp8, and is inert (harmless) otherwise.
+  kv_cache_dtype: auto
+  kv_cache_dtype_skip_layers: [sliding_window]
   # The model accepts images (and video frames). The server downloads any
   # image URLs clients send; to restrict which hosts it will fetch from:
   # allowed_media_domains: [upload.wikimedia.org]
@@ -84,10 +92,19 @@ server:
   api_key_env: VLLM_API_KEY
   public_paths: [/health]            # exact paths reachable without a key
   allowed_prefixes: [/v1, /health, /version, /tokenize, /detokenize]
+  # Optional ceiling on a request's output-token budget. null forwards what the
+  # client asked for; set it (e.g. 8192) to stop one client from reserving so
+  # much output room that long prompts can no longer fit.
+  max_output_tokens: null
+  # When vLLM refuses a request for exceeding the context, retry it this many
+  # times asking for fewer output tokens. The gateway reads the exact numbers
+  # out of vLLM's refusal, so a request that would have failed outright comes
+  # back with a shorter completion instead. 0 disables it.
+  context_retries: 3
   startup_timeout: 3600  # seconds; the first run downloads ~65 GB (model + drafter)
   endpoint_file: run/endpoint.json   # URLs + pid written here once ready (null to disable)
 
 tunnel:
-  enabled: false         # or pass --tunnel
+  enabled: true          # or pass --no-tunnel to keep it local
   authtoken_env: NGROK_AUTHTOKEN
   domain: null           # reserved ngrok domain, e.g. my-llm.ngrok.app

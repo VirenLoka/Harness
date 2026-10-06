@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+uv.lock
+visualizations/
+plugin/node_modules/
+plugin/lib/
+plugin/package-lock.json
+.conda-dock/
+receptors/
+docking/

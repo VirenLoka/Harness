@@ -1,0 +1,26 @@
+[project]
+name = "molbench"
+version = "0.1.0"
+description = "MCP server exposing RDKit heuristics for benchmarking SMARTS transformations"
+requires-python = ">=3.10"
+dependencies = [
+    # 4.x is where ToolResult moved to fastmcp.tools.
+    "fastmcp>=4.0,<5",
+    # rdBase.CaptureErrorLog, used by validate_smiles, needs a recent RDKit.
+    "rdkit>=2025.3",
+    # Ligand PDBQT preparation for docking. scipy and gemmi are imported by
+    # Meeko at import time but are not pulled in by its own metadata.
+    "meeko>=0.8",
+    "scipy",
+    "gemmi",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.uv]
+# Nothing imports molbench as a package; the server is run as a script.
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,54 @@
+# MolBench overlay for the DeepSeek Harness.
+#
+# Pass this file to the harness as an overlay:
+#   npx @deepseek-ai/dsh@0.2.0-rc.2 web --patch /Users/virenloka/Boot/harness/molbench/molbench.cordis.yml
+#
+# One entry is enough: the plugin mounts its own @deepseek-ai/dsh-mcp-client
+# connection to the Python server, so the four RDKit tools arrive as
+# mcp__molbench__<tool> alongside the plugin's own benchmark_transformation.
+#
+# `name` is the absolute path of the built plugin, so nothing has to be
+# installed into the harness. Run `npm run build` in plugin/ first. If you
+# prefer installing it as a package there instead
+# (`npm install /Users/virenloka/Boot/harness/molbench/plugin`), use
+# `name: molbench-harness-plugin`.
+
+- insert:
+    - id: molbench
+      name: /Users/virenloka/Boot/harness/molbench/plugin/lib/index.js
+      config:
+        # Namespace for the Python tools: mcp__molbench__get_molecule_metrics, etc.
+        server: molbench
+        # The project virtualenv, so RDKit and FastMCP are importable.
+        command: /Users/virenloka/Boot/harness/molbench/.venv/bin/python
+        args: ['/Users/virenloka/Boot/harness/molbench/server.py']
+        cwd: /Users/virenloka/Boot/harness/molbench
+        # Products scored per transformation.
+        maxProducts: 3
+        # Attach 2D depictions to benchmark results by default.
+        render: true
+        # Docking engine for dock_and_score: vina, smina or haddock3.
+        defaultEngine: vina
+        # Receptor dock_and_score falls back to when a call names none. Produce
+        # one first with prepare_target_receptor, then paste its path here:
+        # defaultReceptor: /Users/virenloka/Boot/harness/molbench/receptors/3PTB_BEN.pdbqt
+
+# Alternative: let a standalone MCP client entry own the connection, for
+# example to set reconnect or timeout policy. Then the plugin must not open a
+# second connection under the same serverName.
+#
+# - insert:
+#     - id: molbench-server
+#       name: '@deepseek-ai/dsh-mcp-client'
+#       config:
+#         serverName: molbench
+#         transport: stdio
+#         command: /Users/virenloka/Boot/harness/molbench/.venv/bin/python
+#         args: ['/Users/virenloka/Boot/harness/molbench/server.py']
+#         cwd: /Users/virenloka/Boot/harness/molbench
+#         toolCallTimeoutMs: 60000
+#     - id: molbench
+#       name: molbench-harness-plugin
+#       config:
+#         server: molbench
+#         connect: false

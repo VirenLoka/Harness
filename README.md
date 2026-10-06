@@ -185,7 +185,8 @@ See `configs/default.yaml` for every option with comments. The main sections:
   here because the launcher controls them.
 - `env`: extra environment variables for the vLLM process.
 - `server`: gateway bind address and port, internal vLLM port, the name of the
-  env var holding the key, public paths, allowed prefixes, and startup timeout.
+  env var holding the key, public paths, allowed prefixes, startup timeout, and
+  the context-overflow controls (`max_output_tokens`, `context_retries`).
 - `tunnel`: `enabled`, the name of the ngrok authtoken env var, and an
   optional reserved `domain`.
 
@@ -222,6 +223,50 @@ change nothing.
 
 Run `python serve.py --dry-run` to confirm the flags, and check output quality
 on your own prompts before switching over.
+
+## Context budgeting
+
+A request fails when **prompt + requested output** exceeds `max_model_len`:
+
+```
+This model's maximum context length is 131072 tokens. However, you requested
+32768 output tokens and your prompt contains at least 98305 input tokens...
+```
+
+That is arithmetic, not capacity: a client that always reserves 32768 output
+tokens can never send a prompt longer than 98304. vLLM has no server-side
+output cap and no default prompt truncation, so the durable fix belongs on the
+client.
+
+**In the DeepSeek Harness**, a model entry that declares no capacity inherits
+the pi-ai fallbacks `defaultContextWindow: 262144` and `defaultMaxTokens:
+32768` — so the harness believes the window is twice its real size and never
+compacts in time. Declare both in
+`$DSH_HOME/profiles/<profile>/cordis.patch.yml`:
+
+```yaml
+models:
+  - id: muse-glimmer-30b
+    input: [text, image]
+    contextWindow: 131072   # the real window, so compaction fires at the right point
+    maxTokens: 8192         # also becomes this model's per-request default
+```
+
+That leaves 122880 tokens of prompt headroom instead of 98304. Raise
+`maxTokens` if reasoning traces get truncated, or lower
+`default_chat_template_kwargs.reasoning_strength` to `medium` to shorten them.
+
+**The gateway also recovers on its own.** When vLLM refuses a request for
+exceeding the context, the gateway reads the numbers out of the refusal and
+retries with an output budget that fits — `server.context_retries` times, 3 by
+default. A known prompt length is fitted exactly; an "at least" count only
+bounds the prompt from below, so the ask is halved until it fits. A request
+that would have failed outright returns a shorter completion instead, and the
+retry is logged. Set `server.max_output_tokens` to cap every client's request
+up front rather than recovering after the fact.
+
+Raising `max_model_len` past 131072 is not a fix: that is the model's trained
+limit, and going beyond it extrapolates into untested behavior.
 
 ## Smaller GPUs
 

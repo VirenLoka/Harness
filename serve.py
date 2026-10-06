@@ -51,6 +51,8 @@ DEFAULTS: dict[str, Any] = {
         "api_key_env": "VLLM_API_KEY",
         "public_paths": ["/health"],
         "allowed_prefixes": ["/v1", "/health", "/version", "/tokenize", "/detokenize"],
+        "max_output_tokens": None,
+        "context_retries": 3,
         "startup_timeout": 3600,
         "endpoint_file": "run/endpoint.json",
     },
@@ -250,6 +252,8 @@ def start_gateway(cfg: dict[str, Any], api_key: str):
         api_key=api_key,
         public_paths=server_cfg["public_paths"],
         allowed_prefixes=server_cfg["allowed_prefixes"],
+        max_output_tokens=server_cfg["max_output_tokens"],
+        context_retries=server_cfg["context_retries"],
     )
     server = uvicorn.Server(
         uvicorn.Config(
