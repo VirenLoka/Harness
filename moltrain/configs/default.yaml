@@ -1,0 +1,188 @@
+# moltrain: GRPO training for tool-using molecular optimization.
+#
+# Stage order: build tasks (DiffSBDD or a SMILES file) -> collect SFT traces ->
+# SFT warmup -> GRPO. Every stage reads this one file.
+
+molbench:
+  # The tool implementations are imported directly from here. Training needs
+  # neither the DeepSeek Harness nor Node.
+  path: ../molbench
+  receptor_dir: null      # defaults to <path>/receptors
+  docking_dir: null
+  viz_dir: null
+
+episode:
+  max_turns: 8
+  max_tool_calls: 24
+  # The tool surface the policy is trained on. The first seven are the molbench
+  # MCP tools; dock_and_score is the harness plugin's composite, reimplemented
+  # in Python here so the trained surface matches the deployed one.
+  # submit_molecule is always added and ends the episode.
+  tools:
+    - validate_smiles
+    - get_molecule_metrics
+    - apply_smarts_reaction
+    - generate_3d_conformer
+    - run_docking_simulation
+    - get_sbdd_metrics
+    - dock_and_score
+  tool_timeout_s: 900.0
+  max_tool_result_chars: 4000
+  reasoning_strength: high
+
+reward:
+  # Relative to each episode's own starting molecule, so targets of differing
+  # difficulty stay comparable. goal_delta is the improvement worth full credit;
+  # partial progress earns partial credit so the gradient is never flat.
+  thresholds:
+    sa_score:
+      direction: decrease
+      goal_delta: 0.5
+    qed:
+      direction: increase
+      goal_delta: 0.05
+    binding_affinity:
+      direction: decrease   # more negative binds better
+      goal_delta: 0.0       # 0 means "do not get worse"
+      tolerance: 0.5        # kcal/mol of slack before credit is lost
+
+  weights:
+    thresholds: 1.0
+    all_met_bonus: 0.5
+    validity: 0.2
+    novelty: 0.1
+    tool_success: 0.2
+    turn_penalty: 0.005
+    constraint_violation: 0.4   # per broken "do not get worse" rule
+  turn_penalty_free_calls: 10   # measuring is the task, not waste
+  constraint_violation_cap: 3.0  # ceiling on one rule's charge, in tolerances
+  invalid_submission_reward: -1.0
+  no_submission_reward: -1.0
+
+  docking:
+    # off           - 2D properties only; fastest, no affinity signal
+    # final_only    - dock each episode's submitted molecule (default)
+    # every_candidate - dock everything the policy proposes; densest signal
+    #
+    # Run `python -m moltrain.benchmark --mode <each>` to measure episode cost
+    # before committing to one.
+    mode: final_only
+    engine: vina
+    exhaustiveness: 4       # training setting; evaluate at 8 or higher
+    num_modes: 4
+    workers: 8              # concurrent docks; vina is CPU-bound
+    timeout_s: 300.0
+    cache_path: cache/docking.jsonl
+  property_cache_path: cache/properties.jsonl
+
+dataset:
+  # Where each episode's starting molecule comes from.
+  #   diffsbdd          sample the pocket with DiffSBDD (needs the GPU host)
+  #   reference_ligand  the crystal ligand already bound in the pocket
+  #   smiles_file       a flat SMILES list, which needs no GPU at all
+  source: diffsbdd
+  smiles_file: data/starting_molecules.smi
+  tasks_file: data/tasks.jsonl
+
+  pockets:
+    source: crossdocked
+    # Unpack the Pocket2Mol CrossDocked release and point this at the directory
+    # holding both crossdocked_pocket10/ and split_by_name.pt.
+    crossdocked_root: null
+    split: test
+    staging_dir: data/pockets
+    limit: 25               # null takes all 100 test pockets
+    shuffle_seed: 42
+    explicit: []            # [{name, pdb_file, ref_ligand}] when source: explicit
+
+  # The docking box wraps the reference ligand plus padding, clamped per axis.
+  box:
+    padding: 5.0
+    min_size: 18.0
+    max_size: 30.0
+
+  diffsbdd:
+    repo_path: ../DiffSBDD
+    checkpoint: checkpoints/crossdocked_fullatom_cond.ckpt
+    python: null            # interpreter holding DiffSBDD's deps; null = this one
+    n_samples: 20
+    batch_size: null
+    timesteps: null
+    num_nodes_lig: null
+    sanitize: true
+    all_frags: false
+    relax: false
+    timeout_s: 3600.0
+    samples_dir: data/diffsbdd_samples
+    allow_cpu: false        # a diffusion pass on CPU takes hours; fail instead
+
+  filters:
+    starts_per_pocket: 4
+    min_heavy_atoms: 12
+    max_heavy_atoms: 50
+    require_ring: true
+    max_sa_score: null
+    dedupe: true
+
+  baseline:
+    dock: true              # measure each start once, so thresholds have a reference
+
+model:
+  name: meta-models/Muse-Glimmer-30B
+  max_prompt_tokens: 24576
+  max_completion_tokens: 2048
+
+sft:
+  output_dir: runs/sft
+  traces_file: data/sft_traces.jsonl
+  min_reward: 0.45         # below this an episode is not worth imitating
+  require_submission: true
+  require_improvement: true  # do not imitate "measured everything, changed nothing"
+  learning_rate: 1.0e-5
+  num_train_epochs: 2
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  max_seq_length: 8192
+  packing: false
+  warmup_ratio: 0.03
+  logging_steps: 5
+  save_steps: 100
+  bf16: true
+  gradient_checkpointing: true
+  lora:
+    r: 32
+    alpha: 64
+    dropout: 0.05
+
+grpo:
+  output_dir: runs/grpo
+  learning_rate: 1.0e-6
+  num_generations: 8        # rollouts per task; GRPO's group size
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  max_steps: 500
+  beta: 0.02                # KL against the reference policy (the base weights)
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 64
+  # colocate shares one GPU between training and vLLM rollouts, which is what a
+  # single H200 requires. Raise the utilization only if rollouts are starved.
+  vllm_mode: colocate
+  vllm_gpu_memory_utilization: 0.35
+  lora:
+    r: 32
+    alpha: 64
+    dropout: 0.05
+  resume_from_sft: true
+
+evaluate:
+  output_dir: runs/eval
+  docking_mode: final_only
+  exhaustiveness: 16       # training uses 4; a reported number should not
+  num_modes: 9
+  separate_cache: true     # never read a score measured at the training setting
+  docking_cache_path: cache/docking_eval.jsonl
+
+run:
+  seed: 42
+  log_dir: runs/logs
