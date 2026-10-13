@@ -4,3 +4,34 @@
 vllm>=0.29.0
 pyyaml
 pyngrok>=8
+
+# Gateway + tests for the vLLM server
+starlette>=0.27
+httpx>=0.24
+uvicorn>=0.24
+pytest>=8
+
+# Molbench MCP server dependencies (also declared in molbench/pyproject.toml)
+# Note: rdkit is conda-installed in practice; pip install may fail on some platforms
+fastmcp>=4.0,<5
+rdkit>=2025.3
+meeko>=0.8
+scipy
+gemmi
+
+# MolTrain / DiffSBDD training dependencies
+# DiffSBDD uses conda environment.yaml; these are the key pip packages it needs
+torch
+transformers
+datasets
+trl
+peft
+pytorch-lightning
+wandb
+biopython
+imageio
+networkx
+tqdm
+protobuf
+# See DiffSBDD/environment.yaml for full conda spec
+

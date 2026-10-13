@@ -1,1 +1,38 @@
 listen.md
+# macOS
+.DS_Store
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Testing & linting caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Runtime generated files
+run/
+*.log
+endpoint.json
+
+# Conda / Docker artifacts
+.conda-dock/
+
+# IDE
+.vscode/
+.idea/
+
