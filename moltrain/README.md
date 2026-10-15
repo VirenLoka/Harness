@@ -68,9 +68,20 @@ python -m moltrain.evaluate --tasks data/tasks_heldout.jsonl \
   --arms unchanged expert policy
 ```
 
-Hold out pockets by building two task files: run `tasks build` with a
-`dataset.pockets.limit` that covers the training pockets, then again with a
-different `shuffle_seed` or an explicit list and a different `tasks_file`.
+Hold out pockets with `offset` and `limit`, which cut a deterministic window
+out of the shuffled split. Keep the seed the same in both files -- changing it
+reshuffles the *same* pockets and hands back an overlapping subset, which
+leaks training pockets into the evaluation:
+
+```yaml
+# configs/train.yaml       # configs/heldout.yaml
+dataset:                   dataset:
+  pockets:                   pockets:
+    shuffle_seed: 42           shuffle_seed: 42   # the same seed
+    offset: 0                  offset: 25         # starts where training ends
+    limit: 25                  limit: 15
+  tasks_file: data/tasks.jsonl  tasks_file: data/tasks_heldout.jsonl
+```
 
 ## Layout
 
@@ -93,7 +104,68 @@ different `shuffle_seed` or an explicit list and a different `tasks_file`.
 | `trl_compat.py` | Filters settings against the installed TRL's signature |
 | `evaluate.py` | Held-out evaluation against do-nothing and expert controls |
 | `benchmark.py` | Measures episode cost under each docking mode |
-| `tests/` | 104 tests; the full loop runs with a scripted policy, no GPU |
+| `hostcheck.py` | Host diagnostics that survive a broken dependency |
+| `logs.py`, `progress.py` | Run logging, and bars that degrade to log lines |
+| `tests/` | 136 tests; the full loop runs with a scripted policy, no GPU |
+
+## Watching a run
+
+Every stage that can take minutes reports progress, and every command accepts
+the same four flags:
+
+| flag | effect |
+| --- | --- |
+| `--verbose` | console drops to DEBUG: every tool call, every dock, with timings |
+| `--quiet` | warnings and errors only, and no bars |
+| `--no-progress` | keep the logs, drop the bars |
+| `--log-file PATH` | write the run log somewhere specific |
+
+```
+building tasks:  32%|███▏  | 8/25 [04:12<08:55, 31.5s/pocket, 3ks3-002 docking baseline 2/4]
+```
+
+The bar counts pockets, but the **phase** in the postfix is what makes it
+legible. Protonating a receptor takes about a minute, so a bar that only
+counted pockets would still look stuck for the first minute of every one --
+which is exactly how `tasks build` looked before this existed.
+
+Console output goes through `tqdm.write`, so a log line never tears a live bar
+in half.
+
+### Levels, and where the detail goes
+
+The console shows INFO. The run's log file always records DEBUG, so an
+overnight job leaves a full trace even though the console stayed readable. The
+path is printed on stderr when a command starts and the file lands in
+`run.log_dir`.
+
+```yaml
+run:
+  log_dir: runs/logs
+  log_level: INFO     # console only; the file is always DEBUG
+  log_to_file: true
+  progress: auto      # auto | on | off
+```
+
+`progress: auto` is tqdm's own "off when stderr is not a terminal", which keeps
+bars out of redirected logs. An unwritable log directory is a warning, not a
+failed run.
+
+The split the package keeps: library modules **log**, CLIs **print**. A summary
+table is the program's output and belongs on stdout; `docked 3ks3-002 in 4.1s`
+is a diagnostic and belongs on stderr with a timestamp.
+
+### tqdm is optional
+
+It is in the training container, but not everywhere, and the test suite does
+not depend on it. Without it the same `Progress` object logs a status line
+every 30 seconds or 10% of the way, whichever comes first:
+
+```
+INFO  moltrain.progress  building tasks 8/25 (32%) elapsed 4m12s eta 8m55s - 3ks3-002 docking baseline 2/4
+```
+
+So a run is never silent either way. The bar is just the nicer form of it.
 
 ## Building the dataset (Stage 1)
 
@@ -119,6 +191,53 @@ dataset:
     python: /opt/conda/envs/diffsbdd/bin/python
     checkpoint: checkpoints/crossdocked_fullatom_cond.ckpt
 ```
+
+### Running in a thread-capped container
+
+A JupyterLab container typically exposes every core on the host while capping
+how many threads one process may create. OpenBLAS, OMP and MKL each size their
+pool from the visible core count, so the first BLAS-backed import dies or
+hangs:
+
+```
+OpenBLAS blas_thread_init: pthread_create failed for thread 63 of 64:
+Resource temporarily unavailable
+```
+
+Importing `moltrain` caps all five thread variables to `MOLTRAIN_NUM_THREADS`
+(default 8) before any submodule can import numpy, which is the only point
+early enough to matter -- the pool size is read once at load. Every subprocess
+this package starts, including DiffSBDD sampling, inherits the cap.
+
+Anything started outside the package needs them set too:
+
+```bash
+export MOLTRAIN_NUM_THREADS=8
+export OPENBLAS_NUM_THREADS=8 OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
+```
+
+An explicitly set variable always wins, so raise it if the host allows more.
+
+### The checks survive a broken dependency
+
+Each candidate dependency is imported in its own subprocess with a timeout, so
+a missing, broken or hanging install is one line in the report rather than the
+end of it. That is not hypothetical: on the first real run `peft`'s import
+chain reached scipy's BLAS loader, hung, and had to be interrupted -- which
+meant the report never reached the CUDA check or the TRL introspection that
+were the reasons for running it.
+
+### Docking engines
+
+```bash
+conda install -c conda-forge vina smina openbabel
+```
+
+`tasks build` needs Open Babel to prepare receptors, and any docking-based
+threshold needs Vina or smina. The package name is `openbabel`; the binary is
+`obabel`. `MOLBENCH_VINA_BIN`, `MOLBENCH_SMINA_BIN` and `MOLBENCH_OBABEL_BIN`
+override the lookup. With `reward.docking.mode: off` none of them are
+required, and `grpo check` says so rather than reporting a problem.
 
 ### Getting the CrossDocked pockets
 
@@ -439,7 +558,7 @@ settings for docking) and survive restarts. Delete them to force re-evaluation.
 cd /Users/virenloka/Boot/harness && molbench/.venv/bin/python -m pytest moltrain/tests -q
 ```
 
-104 tests. The CrossDocked split tests build their own archive fixture, so
+136 tests. The CrossDocked split tests build their own archive fixture, so
 they need neither torch nor the multi-gigabyte download. The expert's tool
 calls run for real, so the tests also catch an RDKit upgrade breaking the
 move library.

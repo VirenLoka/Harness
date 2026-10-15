@@ -20,8 +20,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from . import logs
 from .config import ConfigError, load_config, resolve
 from .trl_compat import adapt, describe
+
+LOG = logs.get_logger("sft")
 
 
 def training_settings(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -77,36 +80,36 @@ def build_dataset(records: list[dict[str, Any]]):
 
 def check(cfg: dict[str, Any]) -> int:
     """Report whether this host can run the stage, without starting it."""
+    from . import hostcheck
+
     problems: list[str] = []
+
     print("imports")
-    for module in ("torch", "transformers", "trl", "peft", "datasets"):
+    reports, import_problems = hostcheck.report_imports(
+        ("torch", "transformers", "trl", "peft", "datasets")
+    )
+    for report in reports:
+        print(
+            f"  {report.name}: {report.detail if report.ok else 'FAILED - ' + report.detail}"
+        )
+    problems.extend(import_problems)
+
+    print("\ncuda")
+    cuda_lines, cuda_problems = hostcheck.report_cuda()
+    for line in cuda_lines:
+        print(line)
+    problems.extend(cuda_problems)
+
+    if any(r.name == "trl" and r.ok for r in reports):
         try:
-            loaded = __import__(module)
-            print(f"  {module}: {getattr(loaded, '__version__', 'present')}")
-        except ImportError as exc:
-            print(f"  {module}: MISSING ({exc})")
-            problems.append(f"{module} is not installed")
+            from trl import SFTConfig
 
-    try:
-        import torch
-
-        print(f"\ncuda available: {torch.cuda.is_available()}")
-        if torch.cuda.is_available():
-            properties = torch.cuda.get_device_properties(0)
-            memory = properties.total_memory / 1e9
-            print(f"  device: {properties.name} ({memory:.0f} GB)")
-        else:
-            problems.append("no CUDA device; SFT on CPU is not practical")
-    except ImportError:
-        pass
-
-    try:
-        from trl import SFTConfig
-
-        print()
-        print(describe(SFTConfig, training_settings(cfg)))
-    except ImportError:
-        print("\nTRL is absent, so its settings cannot be checked")
+            print()
+            print(describe(SFTConfig, training_settings(cfg)))
+        except Exception as exc:  # noqa: BLE001 - a check reports, it does not raise
+            print(f"\nTRL settings could not be checked: {type(exc).__name__}: {exc}")
+    else:
+        print("\nTRL is not usable, so its settings cannot be checked")
 
     print("\ntraces")
     try:
@@ -175,7 +178,9 @@ def train(cfg: dict[str, Any], *, dry_run: bool = False) -> int:
         train_dataset=dataset,
         peft_config=peft_config,
     )
+    LOG.info("starting SFT; TRL reports its own progress from here")
     trainer.train()
+    LOG.info("SFT finished; saving the adapter")
     trainer.save_model(args.output_dir)
 
     summary = {
@@ -198,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--dry-run", action="store_true", help="build everything but do not train"
     )
+    logs.add_cli_flags(parser)
     args = parser.parse_args(argv)
 
     try:
@@ -205,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
+    logs.configure_from_args(cfg, args, stem=f"sft-{args.command}")
     return check(cfg) if args.command == "check" else train(cfg, dry_run=args.dry_run)
 
 

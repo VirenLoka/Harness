@@ -458,3 +458,35 @@ def test_a_failing_pocket_does_not_abort_the_rest(cfg, tmp_path):
     assert built == []
     assert report.pockets_failed[0]["pocket"] == "gone"
     assert "absent.pdb" in report.pockets_failed[0]["error"]
+
+
+def test_offset_and_limit_cut_a_disjoint_window(cfg):
+    """A training set and a held-out set must not share a pocket."""
+    cfg["dataset"]["pockets"]["limit"] = 2
+    cfg["dataset"]["pockets"]["offset"] = 0
+    training = {p.name for p in crossdocked.select_pockets(cfg)}
+
+    cfg["dataset"]["pockets"]["offset"] = 2
+    cfg["dataset"]["pockets"]["limit"] = None
+    heldout = {p.name for p in crossdocked.select_pockets(cfg)}
+
+    assert len(training) == 2
+    assert heldout
+    assert training & heldout == set()
+
+
+def test_a_different_seed_does_not_give_a_disjoint_set(cfg):
+    """Why offset exists: reseeding reshuffles the same pockets, so the two
+    sets overlap and training pockets leak into the evaluation."""
+    cfg["dataset"]["pockets"]["limit"] = 2
+    cfg["dataset"]["pockets"]["shuffle_seed"] = 1
+    first = {p.name for p in crossdocked.select_pockets(cfg)}
+    cfg["dataset"]["pockets"]["shuffle_seed"] = 2
+    second = {p.name for p in crossdocked.select_pockets(cfg)}
+    assert first & second, "reseeding is not a way to hold pockets out"
+
+
+def test_an_offset_past_the_end_is_an_error_not_an_empty_set(cfg):
+    cfg["dataset"]["pockets"]["offset"] = 999
+    with pytest.raises(CrossDockedError, match="only 3 pockets"):
+        crossdocked.select_pockets(cfg)

@@ -12,11 +12,15 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from . import logs
 from .config import resolve
+
+LOG = logs.get_logger("oracle")
 
 
 @dataclass
@@ -153,7 +157,15 @@ class Oracle:
             return cached.get("binding_affinity")
 
         self.stats["dock_misses"] += 1
+        started = time.monotonic()
         async with self.semaphore:
+            LOG.debug(
+                "docking %s against %s (%s, exhaustiveness %d)",
+                canonical,
+                Path(receptor_file).name,
+                self.engine,
+                self.exhaustiveness,
+            )
             try:
                 result = await asyncio.wait_for(
                     self.server.run_docking_simulation(
@@ -167,11 +179,23 @@ class Oracle:
                     timeout=self.timeout_s,
                 )
             except Exception as exc:  # noqa: BLE001 - a failed dock is a missing value
+                LOG.warning(
+                    "docking failed for %s: %s: %s",
+                    canonical,
+                    type(exc).__name__,
+                    str(exc)[:200],
+                )
                 self.docking_cache.put(
                     key, {"binding_affinity": None, "error": str(exc)[:200]}
                 )
                 return None
         affinity = float(result["binding_affinity"])
+        LOG.debug(
+            "docked %s: %.3f kcal/mol in %.1fs",
+            canonical,
+            affinity,
+            time.monotonic() - started,
+        )
         self.docking_cache.put(key, {"binding_affinity": affinity})
         return affinity
 

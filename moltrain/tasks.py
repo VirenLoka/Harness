@@ -15,11 +15,12 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import crossdocked, diffsbdd
+from . import crossdocked, diffsbdd, logs, progress
 from .config import ConfigError, load_config, resolve
 from .crossdocked import Pocket
 from .episode import Task
@@ -27,6 +28,8 @@ from .oracle import Oracle
 from .toolkit import Toolkit, import_molbench
 
 DEFAULT_BOX = 20.0
+
+LOG = logs.get_logger("tasks")
 
 
 class TaskBuildError(Exception):
@@ -288,7 +291,11 @@ class BuildReport:
 
 
 async def build_tasks(
-    cfg: dict[str, Any], *, refresh: bool = False, limit: int | None = None
+    cfg: dict[str, Any],
+    *,
+    refresh: bool = False,
+    limit: int | None = None,
+    disable_progress: bool | None = None,
 ) -> tuple[list[Task], BuildReport]:
     """Pockets plus starting molecules plus baselines, ready to write out."""
     server = import_molbench(cfg)
@@ -304,38 +311,70 @@ async def build_tasks(
 
     pool = load_smiles_file(cfg) if cfg["dataset"]["source"] == "smiles_file" else None
 
+    LOG.info(
+        "building tasks for %d pockets (source=%s, baseline docking=%s)",
+        len(pockets),
+        cfg["dataset"]["source"],
+        "on" if dock_baseline else "off",
+    )
+
     report = BuildReport()
     tasks: list[Task] = []
 
+    # The bar tracks pockets, but the phase within a pocket is what makes it
+    # legible: protonating a receptor takes about a minute, so a counter alone
+    # still looks stuck.
+    bar = progress.track(
+        total=len(pockets),
+        desc="building tasks",
+        unit="pocket",
+        disable=disable_progress,
+    )
     for pocket in pockets:
         try:
+            bar.postfix(f"{pocket.name} preparing receptor")
+            LOG.debug("preparing receptor for %s", pocket.name)
             receptor = await prepare_receptor(cfg, server, pocket)
+
+            bar.postfix(f"{pocket.name} reading start molecules")
             starts, provenance = await starting_molecules(
                 cfg, pocket, server, smiles_pool=pool, refresh=refresh
             )
         except Exception as exc:  # noqa: BLE001 - one bad pocket must not stop 99
+            LOG.warning("%s failed: %s: %s", pocket.name, type(exc).__name__, exc)
             report.pockets_failed.append(
                 {
                     "pocket": pocket.name,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             )
+            bar.update(1)
             continue
 
         if not starts:
+            LOG.warning("%s: no starting molecule survived the filters", pocket.name)
             report.pockets_failed.append(
                 {
                     "pocket": pocket.name,
                     "error": "no starting molecule survived filters",
                 }
             )
+            bar.update(1)
             continue
 
         provenance["pocket"] = pocket.name
         report.provenance.append(provenance)
         report.pockets_used += 1
+        LOG.info(
+            "%s: %d start molecules kept of %d generated",
+            pocket.name,
+            provenance.get("kept", len(starts)),
+            provenance.get("generated", len(starts)),
+        )
 
         for index, smiles in enumerate(starts):
+            phase = "docking baseline" if dock_baseline else "measuring baseline"
+            bar.postfix(f"{pocket.name} {phase} {index + 1}/{len(starts)}")
             baseline = await oracle.evaluate(
                 smiles,
                 receptor["receptor_file"] if dock_baseline else None,
@@ -345,8 +384,17 @@ async def build_tasks(
             if dock_baseline:
                 if baseline.binding_affinity is None:
                     report.baselines_missing_affinity += 1
+                    LOG.warning(
+                        "%s start %d: docking produced no affinity", pocket.name, index
+                    )
                 else:
                     report.baselines_docked += 1
+                    LOG.debug(
+                        "%s start %d: affinity %.3f kcal/mol",
+                        pocket.name,
+                        index,
+                        baseline.binding_affinity,
+                    )
 
             tasks.append(
                 Task(
@@ -370,7 +418,17 @@ async def build_tasks(
                 )
             )
 
+        bar.update(1)
+
+    bar.close()
     report.tasks = len(tasks)
+    LOG.info(
+        "built %d tasks from %d pockets (%d pockets failed) in %s",
+        len(tasks),
+        report.pockets_used,
+        len(report.pockets_failed),
+        progress.format_seconds(bar.elapsed_s),
+    )
     return tasks, report
 
 
@@ -414,10 +472,15 @@ async def _cmd_probe(cfg: dict[str, Any], args: argparse.Namespace) -> int:
         print(f"  FAILED: {type(exc).__name__}: {exc}")
 
     print("\ndocking binaries")
-    import shutil as _shutil
+    from . import hostcheck
 
-    for binary in ("vina", "smina", "obabel"):
-        print(f"  {binary}: {_shutil.which(binary) or 'NOT FOUND'}")
+    binary_lines, binary_problems = hostcheck.report_binaries(
+        ("vina", "smina", "obabel")
+    )
+    for line in binary_lines:
+        print(line)
+    for problem in binary_problems:
+        print(f"  ! {problem}")
 
     print("\nDiffSBDD")
     runtime = await diffsbdd.probe(cfg)
@@ -484,26 +547,53 @@ async def _cmd_sample(cfg: dict[str, Any], args: argparse.Namespace) -> int:
             print(f"  ! {problem}")
         return 2
 
+    LOG.info(
+        "sampling %d pockets with %s on %s",
+        len(pockets),
+        Path(runtime.checkpoint or "?").name,
+        runtime.device_name or "cpu",
+    )
+
     failures = 0
-    for number, pocket in enumerate(pockets, start=1):
+    bar = progress.track(
+        total=len(pockets),
+        desc="sampling pockets",
+        unit="pocket",
+        disable=logs.progress_disabled(cfg, args),
+    )
+    for pocket in pockets:
+        bar.postfix(f"{pocket.name} generating")
+        started = time.monotonic()
         try:
             path = await diffsbdd.sample_pocket(
                 cfg, pocket, refresh=args.refresh, runtime=runtime
             )
             accepted, rejected = diffsbdd.read_sdf_smiles(path)
-            print(
-                f"[{number}/{len(pockets)}] {pocket.name}: "
-                f"{len(accepted)} usable, {len(rejected)} unreadable -> {path}"
+            LOG.info(
+                "%s: %d usable, %d unreadable in %s -> %s",
+                pocket.name,
+                len(accepted),
+                len(rejected),
+                progress.format_seconds(time.monotonic() - started),
+                path,
             )
         except Exception as exc:  # noqa: BLE001 - keep going through the set
             failures += 1
-            print(f"[{number}/{len(pockets)}] {pocket.name}: FAILED {exc}")
+            LOG.error("%s: FAILED %s", pocket.name, exc)
+        bar.update(1)
+    bar.close()
+
     print(f"\n{len(pockets) - failures}/{len(pockets)} pockets sampled")
     return 1 if failures == len(pockets) else 0
 
 
 async def _cmd_build(cfg: dict[str, Any], args: argparse.Namespace) -> int:
-    tasks, report = await build_tasks(cfg, refresh=args.refresh, limit=args.limit)
+    tasks, report = await build_tasks(
+        cfg,
+        refresh=args.refresh,
+        limit=args.limit,
+        disable_progress=logs.progress_disabled(cfg, args),
+    )
     if not tasks:
         print("no tasks were built")
         print(json.dumps(report.as_dict(), indent=2))
@@ -556,6 +646,16 @@ def main(argv: list[str] | None = None) -> int:
         "--refresh", action="store_true", help="redo work that is already on disk"
     )
     parser.add_argument("--json", action="store_true", help="also dump JSON")
+    parser.add_argument(
+        "--source",
+        default=None,
+        choices=["diffsbdd", "reference_ligand", "smiles_file"],
+        help="override dataset.source; reference_ligand needs no GPU",
+    )
+    parser.add_argument(
+        "--tasks-file", default=None, help="override dataset.tasks_file"
+    )
+    logs.add_cli_flags(parser)
     args = parser.parse_args(argv)
 
     try:
@@ -563,6 +663,13 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
+
+    logs.configure_from_args(cfg, args, stem=f"tasks-{args.command}")
+
+    if args.source:
+        cfg["dataset"]["source"] = args.source
+    if args.tasks_file:
+        cfg["dataset"]["tasks_file"] = args.tasks_file
 
     try:
         return asyncio.run(COMMANDS[args.command](cfg, args))

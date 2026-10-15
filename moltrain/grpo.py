@@ -31,12 +31,15 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import logs, progress
 from .config import ConfigError, load_config, resolve
 from .episode import Task, run_episode
 from .grpo_core import build_batch
 from .oracle import Oracle
 from .toolkit import Toolkit, build_toolkit
 from .traces import RecordingPolicy
+
+LOG = logs.get_logger("grpo")
 
 
 def rollout_tasks(tasks: list[Task], num_generations: int) -> list[Task]:
@@ -58,23 +61,48 @@ async def run_group(
     oracle: Oracle,
     *,
     concurrency: int | None = None,
+    disable_progress: bool | None = None,
 ) -> list[tuple[str, list[tuple[str, str]], str, float, Any]]:
-    """Run every rollout concurrently so the generator can batch their turns."""
+    """Run every rollout concurrently so the generator can batch their turns.
+
+    The bar ticks as rollouts *finish*, not as they start: they all start at
+    once, which is the point -- a group's turns have to be in flight together
+    for the generator to batch them into one decode.
+    """
     limit = asyncio.Semaphore(concurrency or len(tasks) or 1)
+    bar = progress.track(
+        total=len(tasks), desc="rollouts", unit="rollout", disable=disable_progress
+    )
+    finished = 0
 
     async def one(task: Task):
+        nonlocal finished
         async with limit:
             recorder = RecordingPolicy(policy_factory(task))
             result = await run_episode(cfg, task, recorder, toolkit, oracle)
-            return (
-                task.task_id,
-                recorder.turns,
-                result.transcript,
-                result.reward,
-                result,
-            )
+        finished += 1
+        LOG.info(
+            "%s: reward %.3f, %d turns, %d tool calls, %s",
+            task.task_id,
+            result.reward,
+            result.turns,
+            result.tool_calls,
+            result.stop_reason,
+        )
+        bar.postfix(f"last {task.task_id}")
+        bar.update(1)
+        return (
+            task.task_id,
+            recorder.turns,
+            result.transcript,
+            result.reward,
+            result,
+        )
 
-    return list(await asyncio.gather(*(one(task) for task in tasks)))
+    try:
+        return list(await asyncio.gather(*(one(task) for task in tasks)))
+    finally:
+        bar.close()
 
 
 def summarise(results: list[Any], batch: Any, elapsed: float) -> dict[str, Any]:
@@ -186,72 +214,79 @@ def training_settings(cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def check(cfg: dict[str, Any]) -> int:
+    from . import hostcheck
     from .trl_compat import accepted_names, describe
 
     problems: list[str] = []
+
     print("imports")
-    for module in ("torch", "transformers", "trl", "peft", "vllm", "datasets"):
+    reports, import_problems = hostcheck.report_imports(
+        ("torch", "transformers", "trl", "peft", "vllm", "datasets")
+    )
+    for report in reports:
+        state = report.detail if report.ok else "FAILED - " + report.detail
+        print(f"  {report.name}: {state}")
+    problems.extend(import_problems)
+
+    print("\ncuda")
+    cuda_lines, cuda_problems = hostcheck.report_cuda()
+    for line in cuda_lines:
+        print(line)
+    problems.extend(cuda_problems)
+
+    print("\ndocking binaries")
+    binary_lines, binary_problems = hostcheck.report_binaries(
+        ("vina", "smina", "obabel")
+    )
+    for line in binary_lines:
+        print(line)
+    if cfg["reward"]["docking"]["mode"] != "off":
+        problems.extend(binary_problems)
+    elif binary_problems:
+        print("  (reward.docking.mode is off, so these are not required)")
+
+    if any(r.name == "trl" and r.ok for r in reports):
         try:
-            loaded = __import__(module)
-            print(f"  {module}: {getattr(loaded, '__version__', 'present')}")
-        except ImportError as exc:
-            print(f"  {module}: MISSING ({exc})")
-            problems.append(f"{module} is not installed")
+            from trl import GRPOConfig, GRPOTrainer
 
-    try:
-        import torch
+            print()
+            print(describe(GRPOConfig, training_settings(cfg)))
 
-        print(f"\ncuda available: {torch.cuda.is_available()}")
-        if torch.cuda.is_available():
-            properties = torch.cuda.get_device_properties(0)
-            print(
-                f"  device: {properties.name} ({properties.total_memory / 1e9:.0f} GB)"
-            )
-        else:
-            problems.append("no CUDA device; GRPO needs one")
-    except ImportError:
-        pass
-
-    try:
-        from trl import GRPOConfig, GRPOTrainer
-
-        print()
-        print(describe(GRPOConfig, training_settings(cfg)))
-
-        trainer_args = accepted_names(GRPOTrainer.__init__)
-        print("\nGRPOTrainer:")
-        for name in ("rollout_func", "peft_config", "reward_funcs", "args"):
-            present = (
-                "ok      " if (not trainer_args or name in trainer_args) else "ABSENT  "
-            )
-            print(f"  {present} {name}")
-        if trainer_args and "rollout_func" not in trainer_args:
-            problems.append(
-                "this TRL's GRPOTrainer has no `rollout_func`, so it cannot run "
-                "this package's multi-turn tool loop; upgrade TRL"
-            )
-
-        # The mask decides whether tool output is trained on, so its support is
-        # not a nice-to-have.
-        import inspect
-
-        source = ""
-        try:
-            source = inspect.getsource(GRPOTrainer)
-        except (OSError, TypeError):
-            pass
-        if source:
-            honoured = "completion_mask" in source
-            print(f"\n  completion_mask referenced in GRPOTrainer: {honoured}")
-            if not honoured:
+            trainer_args = accepted_names(GRPOTrainer.__init__)
+            print("\nGRPOTrainer:")
+            for name in ("rollout_func", "peft_config", "reward_funcs", "args"):
+                known = not trainer_args or name in trainer_args
+                print(f"  {'ok      ' if known else 'ABSENT  '} {name}")
+            if trainer_args and "rollout_func" not in trainer_args:
                 problems.append(
-                    "this TRL's GRPOTrainer never mentions `completion_mask`; "
-                    "confirm environment tokens are excluded from the loss "
-                    "before training, or the policy will learn to write tool "
-                    "output itself"
+                    "this TRL's GRPOTrainer has no `rollout_func`, so it cannot "
+                    "run this package's multi-turn tool loop; upgrade TRL"
                 )
-    except ImportError:
-        print("\nTRL is absent, so its settings cannot be checked")
+
+            # The mask decides whether tool output is trained on, so its
+            # support is not a nice-to-have.
+            import inspect
+
+            source = ""
+            try:
+                source = inspect.getsource(GRPOTrainer)
+            except (OSError, TypeError):
+                pass
+            if source:
+                honoured = "completion_mask" in source
+                print(f"\n  completion_mask referenced in GRPOTrainer: {honoured}")
+                if not honoured:
+                    problems.append(
+                        "this TRL's GRPOTrainer never mentions `completion_mask`; "
+                        "confirm environment tokens are excluded from the loss "
+                        "before training, or the policy will learn to write "
+                        "tool output itself"
+                    )
+        except Exception as exc:  # noqa: BLE001 - a check reports
+            print(f"\nTRL could not be inspected: {type(exc).__name__}: {exc}")
+            problems.append(f"TRL is installed but unusable: {exc}")
+    else:
+        print("\nTRL is not usable, so its settings cannot be checked")
 
     print("\ntasks")
     try:
@@ -307,8 +342,21 @@ async def _rollout_only(cfg: dict[str, Any], args: argparse.Namespace) -> int:
         cfg, load_engine(cfg), build_sampling_params(cfg), max_batch=len(expanded)
     )
 
+    LOG.info(
+        "rolling out %d tasks x %d generations = %d episodes",
+        len(tasks),
+        num_generations,
+        len(expanded),
+    )
     started = time.monotonic()
-    episodes = await run_group(cfg, expanded, lambda _t: policy, toolkit, oracle)
+    episodes = await run_group(
+        cfg,
+        expanded,
+        lambda _t: policy,
+        toolkit,
+        oracle,
+        disable_progress=logs.progress_disabled(cfg, args),
+    )
     elapsed = time.monotonic() - started
 
     batch = build_batch(
@@ -388,7 +436,9 @@ def train(cfg: dict[str, Any], *, dry_run: bool = False) -> int:
         peft_config=peft_config,
         rollout_func=make_rollout_func(cfg, {t.task_id: t for t in tasks}),
     )
+    LOG.info("starting GRPO; TRL reports its own progress from here")
     trainer.train()
+    LOG.info("GRPO finished; saving the adapter")
     trainer.save_model(args.output_dir)
     Path(args.output_dir, "moltrain_grpo.json").write_text(
         json.dumps(
@@ -409,6 +459,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tasks", default=None)
     parser.add_argument("--tasks-per-step", type=int, default=1)
     parser.add_argument("--dry-run", action="store_true")
+    logs.add_cli_flags(parser)
     args = parser.parse_args(argv)
 
     try:
@@ -416,6 +467,7 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
+    logs.configure_from_args(cfg, args, stem=f"grpo-{args.command}")
 
     if args.command == "check":
         return check(cfg)

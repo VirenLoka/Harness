@@ -333,6 +333,21 @@ def select_pockets(cfg: dict[str, Any]) -> list[Pocket]:
     if seed is not None:
         random.Random(int(seed)).shuffle(pockets)
 
+    # `offset` then `limit` cut a deterministic window out of the shuffled
+    # split, so a training set and a held-out set are disjoint by
+    # construction. Changing the seed instead would reshuffle the same pockets
+    # and hand back an overlapping subset, leaking training pockets into the
+    # evaluation.
+    offset = int(pockets_cfg.get("offset") or 0)
+    if offset < 0:
+        raise CrossDockedError("dataset.pockets.offset cannot be negative")
+    if offset >= len(pockets):
+        raise CrossDockedError(
+            f"dataset.pockets.offset is {offset} but the {pockets_cfg['split']} "
+            f"split has only {len(pockets)} pockets"
+        )
+    pockets = pockets[offset:]
+
     limit = pockets_cfg.get("limit")
     if limit is not None:
         pockets = pockets[: int(limit)]

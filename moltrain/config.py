@@ -106,7 +106,10 @@ DEFAULTS: dict[str, Any] = {
             # Pocket PDBs are copied here under their own name before the
             # receptor is prepared; see stage_pocket_pdb.
             "staging_dir": "data/pockets",
-            "limit": 25,  # null takes every pocket in the split
+            # offset then limit cut a window out of the shuffled split, so a
+            # training set and a held-out set are disjoint by construction.
+            "offset": 0,
+            "limit": 25,  # null takes every pocket from the offset onward
             "shuffle_seed": 42,  # null keeps the split's own order
             # [{name, pdb_file, ref_ligand}] - used when source is `explicit`
             "explicit": [],
@@ -213,6 +216,12 @@ DEFAULTS: dict[str, Any] = {
     "run": {
         "seed": 42,
         "log_dir": "runs/logs",
+        # Console level; the run's log file always records DEBUG.
+        "log_level": "INFO",
+        "log_to_file": True,
+        # auto | on | off -- auto means off when stderr is not a terminal, so
+        # bars stay out of redirected logs.
+        "progress": "auto",
     },
 }
 

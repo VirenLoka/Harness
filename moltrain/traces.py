@@ -25,13 +25,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import logs, progress
 from .config import ConfigError, load_config, resolve
 from .episode import EpisodeResult, Task, run_episode
 from .experts import ScriptedExpert
 from .oracle import Oracle
+from .tasks import TaskBuildError
 from .toolkit import Toolkit, build_toolkit
 
 PolicyFactory = Callable[[Task], Callable[[str], str | Awaitable[str]]]
+
+LOG = logs.get_logger("traces")
 
 
 class RecordingPolicy:
@@ -141,6 +145,7 @@ async def collect(
     attempts: int = 1,
     toolkit: Toolkit | None = None,
     oracle: Oracle | None = None,
+    disable_progress: bool | None = None,
 ) -> tuple[list[dict[str, Any]], list[EpisodeResult], TraceReport]:
     """Run episodes, keep the good ones, and split them into SFT records."""
     toolkit = toolkit or build_toolkit(cfg)
@@ -153,8 +158,22 @@ async def collect(
     episodes: list[EpisodeResult] = []
     report = TraceReport()
 
+    LOG.info(
+        "collecting traces from %d tasks x %d attempt(s); keeping reward >= %.2f",
+        len(tasks),
+        attempts,
+        min_reward,
+    )
+    bar = progress.track(
+        total=len(tasks) * attempts,
+        desc="collecting traces",
+        unit="episode",
+        disable=disable_progress,
+    )
+
     for task in tasks:
         for attempt in range(attempts):
+            bar.postfix(f"{task.task_id} attempt {attempt + 1}/{attempts}")
             # A fresh Task per attempt: run_episode fills in `baseline`, and
             # sharing it across attempts would hide a re-measurement bug.
             trial = Task.from_dict(task.as_dict())
@@ -173,19 +192,38 @@ async def collect(
             report.malformed_calls += result.malformed_calls
             episodes.append(result)
 
+            reason = None
             if result.reward < min_reward:
-                continue
-            if require_submission and not result.submitted_smiles:
-                continue
-            if result.malformed_calls:
-                continue  # never teach a format the parser rejected
-            if require_improvement and not _improved(result):
+                reason = f"reward {result.reward:.3f} below {min_reward:.2f}"
+            elif require_submission and not result.submitted_smiles:
+                reason = "no submission"
+            elif result.malformed_calls:
+                reason = "malformed turns"  # never teach a format the parser rejects
+            elif require_improvement and not _improved(result):
                 # An episode that measured carefully and found nothing is
                 # honest work, but imitating it teaches "submit the input".
+                reason = "moved no goal"
+            if reason is not None:
+                LOG.info(
+                    "%s dropped (%s) after %d tool calls in %s",
+                    trial.task_id,
+                    reason,
+                    result.tool_calls,
+                    progress.format_seconds(result.wall_time_s),
+                )
+                bar.update(1)
                 continue
 
             report.kept += 1
             report.kept_rewards.append(result.reward)
+            LOG.info(
+                "%s kept: reward %.3f, %d turns, %d tool calls in %s",
+                trial.task_id,
+                result.reward,
+                len(policy.turns),
+                result.tool_calls,
+                progress.format_seconds(result.wall_time_s),
+            )
             for index, (prompt, completion) in enumerate(policy.turns):
                 records.append(
                     {
@@ -199,8 +237,17 @@ async def collect(
                 )
                 report.prompt_chars.append(len(prompt))
                 report.completion_chars.append(len(completion))
+            bar.update(1)
 
+    bar.close()
     report.records = len(records)
+    LOG.info(
+        "kept %d/%d episodes -> %d records in %s",
+        report.kept,
+        report.episodes,
+        len(records),
+        progress.format_seconds(bar.elapsed_s),
+    )
     return records, episodes, report
 
 
@@ -240,7 +287,11 @@ async def _run(cfg: dict[str, Any], args: argparse.Namespace) -> int:
         factory = vllm_factory(cfg)
 
     records, episodes, report = await collect(
-        cfg, tasks, factory, attempts=args.attempts
+        cfg,
+        tasks,
+        factory,
+        attempts=args.attempts,
+        disable_progress=logs.progress_disabled(cfg, args),
     )
     path = write_records(cfg, records)
     report_path = path.with_name(path.stem + "_report.json")
@@ -295,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
         default=1,
         help="episodes per task; >1 is rejection sampling",
     )
+    logs.add_cli_flags(parser)
     args = parser.parse_args(argv)
 
     try:
@@ -302,7 +354,12 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
-    return asyncio.run(_run(cfg, args))
+    logs.configure_from_args(cfg, args, stem=f"traces-{args.command}")
+    try:
+        return asyncio.run(_run(cfg, args))
+    except (TaskBuildError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

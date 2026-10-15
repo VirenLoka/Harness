@@ -8,6 +8,7 @@ characterised on.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from moltrain import atem, grpo_core
+from moltrain import atem, grpo_core, hostcheck
 from moltrain import policy as policy_mod
 from moltrain.config import load_config
 from moltrain.episode import Task, run_episode
@@ -624,3 +625,90 @@ def test_an_episode_that_moved_no_goal_is_not_collected(cfg):
         }
     )
     assert _improved(constraint_only) is False
+
+
+# --------------------------------------------------- host diagnostics
+
+
+def test_importing_the_package_caps_the_thread_pools():
+    """A container can expose 64 cores while capping threads per process, and
+    every BLAS-backed import then dies before it starts."""
+    import moltrain
+    from moltrain.hostcheck import THREAD_VARS
+
+    for name in THREAD_VARS:
+        assert os.environ.get(name), f"{name} should have a default"
+    assert os.environ["OPENBLAS_NUM_THREADS"] == moltrain.NUM_THREADS
+
+
+def test_an_explicit_thread_setting_wins(monkeypatch):
+    monkeypatch.setenv("MOLTRAIN_NUM_THREADS", "3")
+    env = hostcheck.thread_limited_env()
+    assert all(env[name] == "3" for name in hostcheck.THREAD_VARS)
+
+
+def test_a_thread_limit_is_passed_explicitly():
+    env = hostcheck.thread_limited_env(2)
+    assert all(env[name] == "2" for name in hostcheck.THREAD_VARS)
+
+
+def test_the_blas_failure_is_recognised():
+    noise = (
+        "OpenBLAS blas_thread_init: pthread_create failed for thread 63 of 64: "
+        "Resource temporarily unavailable"
+    )
+    assert hostcheck.looks_like_blas_thread_failure(noise)
+    assert not hostcheck.looks_like_blas_thread_failure("ImportError: no module")
+    assert "MOLTRAIN_NUM_THREADS" in hostcheck.BLAS_HINT
+
+
+def test_a_module_that_imports_is_reported_with_its_version():
+    report = hostcheck.probe_module("json")
+    assert report.ok
+    assert report.detail
+
+
+def test_a_missing_module_is_a_line_not_an_exception():
+    report = hostcheck.probe_module("definitely_not_a_real_module_xyz")
+    assert not report.ok
+    assert "ModuleNotFoundError" in report.detail
+
+
+def test_a_hanging_import_times_out_rather_than_blocking():
+    """The first real run hung inside peft's import chain until interrupted."""
+    report = hostcheck.probe_module("json", timeout_s=0.001)
+    assert not report.ok
+    assert report.timed_out
+
+
+def test_one_broken_dependency_does_not_end_the_report():
+    reports, problems = hostcheck.report_imports(
+        ("json", "definitely_not_a_real_module_xyz", "pathlib")
+    )
+    assert [r.name for r in reports] == [
+        "json",
+        "definitely_not_a_real_module_xyz",
+        "pathlib",
+    ]
+    assert [r.ok for r in reports] == [True, False, True]
+    assert len(problems) == 1
+
+
+def test_missing_binaries_name_the_conda_packages():
+    lines, problems = hostcheck.report_binaries(("definitely_not_a_binary_xyz",))
+    assert "NOT FOUND" in lines[0]
+    assert "conda install -c conda-forge" in problems[0]
+
+
+def test_obabel_is_installed_under_its_package_name():
+    """`conda install obabel` does not exist; the package is openbabel."""
+    _, problems = hostcheck.report_binaries(("obabel",))
+    if problems:  # only when it is genuinely absent on this host
+        assert "openbabel" in problems[0]
+
+
+def test_an_override_counts_as_finding_the_binary(monkeypatch):
+    monkeypatch.setenv("MOLBENCH_VINA_BIN", "/opt/vina/bin/vina")
+    lines, problems = hostcheck.report_binaries(("vina",))
+    assert "/opt/vina/bin/vina" in lines[0]
+    assert problems == []

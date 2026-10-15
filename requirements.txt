@@ -4,6 +4,9 @@
 vllm>=0.29.0
 pyyaml
 pyngrok>=8
+# Progress bars for moltrain's long stages; it falls back to periodic log
+# lines when absent, so this is a convenience rather than a hard requirement.
+tqdm
 
 # Gateway + tests for the vLLM server
 starlette>=0.27

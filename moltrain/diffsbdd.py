@@ -15,15 +15,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import hostcheck, logs
 from .config import resolve
 from .crossdocked import Pocket
+
+LOG = logs.get_logger("diffsbdd")
 
 
 class DiffSBDDError(Exception):
@@ -134,11 +136,15 @@ async def probe(cfg: dict[str, Any]) -> Runtime:
     if not present:
         problems.append(f"checkpoint not found: {checkpoint}")
 
+    # A probe that prints a version string has no business allocating one
+    # thread per core, and in a thread-capped container trying to would stop
+    # it importing torch at all.
     process = await asyncio.create_subprocess_exec(
         python,
         "-c",
         _PROBE,
         cwd=str(repo),
+        env=hostcheck.thread_limited_env(),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -148,10 +154,18 @@ async def probe(cfg: dict[str, Any]) -> Runtime:
         if line.startswith("MOLTRAIN_PROBE "):
             report = json.loads(line[len("MOLTRAIN_PROBE ") :])
     if not report:
-        tail = stderr.decode(errors="replace").strip().splitlines()[-4:]
+        text = stderr.decode(errors="replace")
+        tail = [
+            line
+            for line in text.strip().splitlines()
+            if line.strip() and not line.startswith("OpenBLAS ")
+        ][-4:]
         problems.append(
-            f"{python} could not report on its environment: " + " / ".join(tail)
+            f"{python} could not report on its environment: "
+            + (" / ".join(tail) or "no output")
         )
+        if hostcheck.looks_like_blas_thread_failure(text):
+            problems.append(hostcheck.BLAS_HINT)
 
     for key in ("error", "import_error"):
         if report.get(key):
@@ -239,6 +253,7 @@ async def sample_pocket(
     settings = cfg["dataset"]["diffsbdd"]
     outfile = samples_dir(cfg, create=True) / f"{pocket.name}.sdf"
     if outfile.is_file() and outfile.stat().st_size > 0 and not refresh:
+        LOG.info("%s already sampled, reusing %s", pocket.name, outfile.name)
         return outfile
 
     if not settings["allow_cpu"]:
@@ -251,8 +266,9 @@ async def sample_pocket(
             )
 
     command = build_command(cfg, pocket, outfile)
-    environment = dict(os.environ)
-    environment.setdefault("PYTHONUNBUFFERED", "1")
+    LOG.debug("running: %s", " ".join(command))
+    LOG.info("sampling %d ligands for %s", int(settings["n_samples"]), pocket.name)
+    environment = hostcheck.thread_limited_env()
     process = await asyncio.create_subprocess_exec(
         *command,
         cwd=str(repo_path(cfg)),

@@ -91,7 +91,8 @@ dataset:
     crossdocked_root: null
     split: test
     staging_dir: data/pockets
-    limit: 25               # null takes all 100 test pockets
+    offset: 0               # offset+limit cut a disjoint window
+    limit: 25               # null takes everything from the offset on
     shuffle_seed: 42
     explicit: []            # [{name, pdb_file, ref_ligand}] when source: explicit
 
@@ -186,3 +187,6 @@ evaluate:
 run:
   seed: 42
   log_dir: runs/logs
+  log_level: INFO       # console level; the log file always records DEBUG
+  log_to_file: true
+  progress: auto        # auto | on | off

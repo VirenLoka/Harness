@@ -16,7 +16,7 @@ import statistics
 import time
 from pathlib import Path
 
-from . import atem
+from . import atem, logs, progress
 from .config import load_config
 from .episode import Task, run_episode
 from .oracle import Oracle
@@ -26,6 +26,8 @@ from .toolkit import build_toolkit
 # candidate, then submit. This is what a competent policy does.
 BENZAMIDINE = "c1ccc(cc1)C(=N)N"
 CANDIDATE = "Cc1ccc(cc1)C(=N)N"
+
+LOG = logs.get_logger("benchmark")
 
 
 def realistic_policy(
@@ -73,6 +75,7 @@ async def measure(
     fresh_cache: bool,
     start: str = BENZAMIDINE,
     candidate: str = CANDIDATE,
+    disable_progress: bool | None = None,
 ):
     cfg["reward"]["docking"]["mode"] = mode
     if fresh_cache:
@@ -88,7 +91,12 @@ async def measure(
     oracle = Oracle(cfg, toolkit)
 
     durations, docks, rewards = [], [], []
+    LOG.info("measuring %d episodes with docking mode `%s`", episodes, mode)
+    bar = progress.track(
+        total=episodes, desc=f"mode {mode}", unit="episode", disable=disable_progress
+    )
     for index in range(episodes):
+        bar.postfix(f"episode {index + 1}/{episodes}")
         # A distinct task id per episode; the molecule is the same, so later
         # episodes show the cache effect that GRPO's repeated sampling gets.
         task = Task(
@@ -104,6 +112,16 @@ async def measure(
         durations.append(time.monotonic() - started)
         docks.append(result.docks_run)
         rewards.append(result.reward)
+        LOG.info(
+            "%s episode %d: %s, %d docks, reward %.3f",
+            mode,
+            index + 1,
+            progress.format_seconds(durations[-1]),
+            result.docks_run,
+            result.reward,
+        )
+        bar.update(1)
+    bar.close()
     return {
         "mode": mode,
         "first_s": durations[0],
@@ -133,7 +151,9 @@ def main() -> None:
     parser.add_argument(
         "--candidate", default=CANDIDATE, help="analog the policy tests"
     )
+    logs.add_cli_flags(parser)
     args = parser.parse_args()
+    logs.configure_from_args(load_config(args.config), args, stem="benchmark")
 
     print(
         f"{'mode':16s} {'1st ep':>8s} {'median':>8s} {'docks(1st)':>11s} {'reward':>8s}  {'GRPO step':>10s}"
@@ -149,6 +169,7 @@ def main() -> None:
                 not args.keep_cache,
                 args.start,
                 args.candidate,
+                disable_progress=logs.progress_disabled(cfg, args),
             )
         )
         # One GRPO step runs `generations` rollouts of one task. Rollouts after

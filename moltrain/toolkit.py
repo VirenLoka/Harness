@@ -21,7 +21,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import logs
 from .config import resolve
+
+LOG = logs.get_logger("toolkit")
 
 
 @dataclass
@@ -102,6 +105,21 @@ def import_molbench(cfg: dict[str, Any]):
     import server
 
     return server
+
+
+def _summarise_arguments(arguments: dict[str, Any], limit: int = 120) -> str:
+    """Arguments on one line, with long values clipped.
+
+    A receptor path or a reaction SMARTS can be long enough to drown the log,
+    and the point of this line is to see which tool ran on what.
+    """
+    parts = []
+    for key, value in arguments.items():
+        text = str(value)
+        if len(text) > limit:
+            text = text[:limit] + "..."
+        parts.append(f"{key}={text}")
+    return ", ".join(parts)
 
 
 def _describe(fn: Callable[..., Any]) -> tuple[str, dict[str, Any]]:
@@ -290,6 +308,7 @@ class Toolkit:
             )
 
         started = time.monotonic()
+        LOG.debug("-> %s(%s)", name, _summarise_arguments(arguments))
         try:
             if spec.is_async:
                 content = await asyncio.wait_for(
@@ -300,6 +319,7 @@ class Toolkit:
                     asyncio.to_thread(spec.fn, **arguments), timeout=self.timeout_s
                 )
         except TypeError as exc:  # wrong or missing arguments
+            LOG.debug("<- %s rejected its arguments: %s", name, exc)
             return ToolResult(
                 name=name,
                 ok=False,
@@ -308,6 +328,7 @@ class Toolkit:
                 duration_s=time.monotonic() - started,
             )
         except TimeoutError:
+            LOG.warning("%s timed out after %.0fs", name, self.timeout_s)
             return ToolResult(
                 name=name,
                 ok=False,
@@ -324,6 +345,7 @@ class Toolkit:
                 if type(exc).__name__ == "ToolError"
                 else f"{type(exc).__name__}: {exc}"
             )
+            LOG.debug("<- %s failed: %s", name, message)
             return ToolResult(
                 name=name,
                 ok=False,
@@ -331,9 +353,9 @@ class Toolkit:
                 error=message,
                 duration_s=time.monotonic() - started,
             )
-        return ToolResult(
-            name=name, ok=True, content=content, duration_s=time.monotonic() - started
-        )
+        duration = time.monotonic() - started
+        LOG.debug("<- %s ok in %.2fs", name, duration)
+        return ToolResult(name=name, ok=True, content=content, duration_s=duration)
 
 
 def build_toolkit(cfg: dict[str, Any]) -> Toolkit:

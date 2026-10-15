@@ -27,12 +27,15 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import atem
+from . import atem, logs, progress
 from .config import ConfigError, load_config, resolve
 from .episode import EpisodeResult, Task, run_episode
 from .experts import ScriptedExpert
 from .oracle import Oracle
+from .tasks import TaskBuildError
 from .toolkit import Toolkit, build_toolkit
+
+LOG = logs.get_logger("evaluate")
 
 
 def unchanged_factory(cfg: dict[str, Any]) -> Callable[[Task], Callable[[str], str]]:
@@ -153,15 +156,31 @@ async def evaluate_arm(
     oracle: Oracle,
     *,
     episodes_per_task: int = 1,
+    disable_progress: bool | None = None,
 ) -> tuple[ArmReport, list[dict[str, Any]]]:
     report = ArmReport(name=name)
     rows: list[dict[str, Any]] = []
+    bar = progress.track(
+        total=len(tasks) * episodes_per_task,
+        desc=f"arm {name}",
+        unit="episode",
+        disable=disable_progress,
+    )
     for task in tasks:
         for attempt in range(episodes_per_task):
             trial = Task.from_dict(task.as_dict())
             trial.task_id = f"{task.task_id}~{name}~{attempt}"
+            bar.postfix(f"{task.task_id} ({attempt + 1}/{episodes_per_task})")
             result = await run_episode(cfg, trial, factory(trial), toolkit, oracle)
             report.add(result, trial.smiles)
+            LOG.info(
+                "%s %s: reward %.3f, %d tool calls, %s",
+                name,
+                task.task_id,
+                result.reward,
+                result.tool_calls,
+                result.stop_reason,
+            )
             rows.append(
                 {
                     "arm": name,
@@ -178,6 +197,8 @@ async def evaluate_arm(
                     "wall_time_s": result.wall_time_s,
                 }
             )
+            bar.update(1)
+    bar.close()
     return report, rows
 
 
@@ -210,7 +231,7 @@ async def _run(cfg: dict[str, Any], args: argparse.Namespace) -> int:
     reports: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
     for name, factory in arms.items():
-        print(f"running arm `{name}` over {len(tasks)} tasks...")
+        LOG.info("running arm `%s` over %d tasks", name, len(tasks))
         report, arm_rows = await evaluate_arm(
             evaluated,
             name,
@@ -219,6 +240,7 @@ async def _run(cfg: dict[str, Any], args: argparse.Namespace) -> int:
             toolkit,
             oracle,
             episodes_per_task=args.episodes_per_task,
+            disable_progress=logs.progress_disabled(evaluated, args),
         )
         reports.append(report.as_dict())
         rows.extend(arm_rows)
@@ -280,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=["unchanged", "expert", "policy"],
         help="`policy` loads the model; the other two need no GPU",
     )
+    logs.add_cli_flags(parser)
     args = parser.parse_args(argv)
 
     try:
@@ -287,7 +310,12 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
-    return asyncio.run(_run(cfg, args))
+    logs.configure_from_args(cfg, args, stem="evaluate")
+    try:
+        return asyncio.run(_run(cfg, args))
+    except (TaskBuildError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
