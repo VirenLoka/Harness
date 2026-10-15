@@ -1,0 +1,48 @@
+# Training half of the CrossDocked test split.
+#
+# This file holds only what differs from the packaged defaults, so editing
+# `default.yaml` in place is never necessary -- which also keeps `git pull`
+# from conflicting with your host-specific paths.
+#
+# Pair it with `heldout.yaml`: the two share a shuffle seed and take disjoint
+# windows of the same split, so no training pocket can reach the evaluation.
+
+dataset:
+  source: diffsbdd
+
+  pockets:
+    source: crossdocked
+    # SET THIS: the directory holding both crossdocked_pocket10/ and
+    # split_by_name.pt.
+    crossdocked_root: /home/jovyan/data/crossdocked
+    split: test
+    shuffle_seed: 42        # must match heldout.yaml
+    offset: 0
+    limit: 25
+
+  diffsbdd:
+    repo_path: ../DiffSBDD
+    checkpoint: checkpoints/crossdocked_fullatom_cond.ckpt
+    python: null            # the `harness` env has torch, so this one works
+    n_samples: 20
+    samples_dir: data/diffsbdd_samples
+
+  tasks_file: data/tasks.jsonl
+
+reward:
+  docking:
+    # final_only docks the submitted molecule; every_candidate docks each one
+    # the policy touches, for a denser signal. Decide with
+    # `python -m moltrain.benchmark` on this host.
+    mode: final_only
+    exhaustiveness: 4       # training setting; evaluation uses 16
+    workers: 8
+
+sft:
+  traces_file: data/sft_traces.jsonl
+  output_dir: runs/sft
+
+grpo:
+  output_dir: runs/grpo
+  num_generations: 8
+  max_steps: 500

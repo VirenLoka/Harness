@@ -1,0 +1,39 @@
+# Held-out half of the CrossDocked test split.
+#
+# Same seed as train.yaml, next window of the shuffled split. Reseeding
+# instead would reshuffle the same pockets and hand back an overlapping
+# subset, which leaks training pockets into the evaluation.
+
+dataset:
+  source: diffsbdd
+
+  pockets:
+    source: crossdocked
+    # SET THIS to the same path as train.yaml.
+    crossdocked_root: /home/jovyan/data/crossdocked
+    split: test
+    shuffle_seed: 42        # the same seed as train.yaml
+    offset: 25              # starts where training ends
+    limit: 15
+
+  diffsbdd:
+    repo_path: ../DiffSBDD
+    checkpoint: checkpoints/crossdocked_fullatom_cond.ckpt
+    python: null
+    n_samples: 20
+    # The same directory is safe: sample files are named by pocket, and the
+    # pocket windows are disjoint.
+    samples_dir: data/diffsbdd_samples
+
+  tasks_file: data/tasks_heldout.jsonl
+
+reward:
+  docking:
+    mode: final_only
+    exhaustiveness: 4
+    workers: 8
+
+evaluate:
+  output_dir: runs/eval
+  exhaustiveness: 16        # a reported number should not use the training setting
+  separate_cache: true

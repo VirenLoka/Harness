@@ -52,6 +52,11 @@ def thread_limited_env(limit: str | int | None = None) -> dict[str, str]:
     for name in THREAD_VARS:
         environment[name] = value
     environment.setdefault("PYTHONUNBUFFERED", "1")
+    
+    # Ensure CUDA visibility is preserved for GPU-accelerated subprocesses
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        environment["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"]
+        
     return environment
 
 
