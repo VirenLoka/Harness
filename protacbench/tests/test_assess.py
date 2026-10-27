@@ -361,3 +361,46 @@ def test_a_task_has_everything_needed_without_the_csv(tmp_path, cfg):
         "linker_size",
         "prompt",
     }
+
+
+# ------------------------------------------------------------- sample reuse
+
+
+def test_leftover_directories_do_not_count_as_samples(tmp_path, cfg):
+    """`sample` must reuse only what `assess` can actually read.
+
+    An interrupted run leaves the per-PROTAC directories behind without
+    writing an XYZ into them. Testing the output directory for any content at
+    all then reports "reusing them" for a directory assessment reads as empty,
+    and the pipeline stalls with no way to tell which half is wrong.
+    """
+    import asyncio
+
+    from protacbench import runner
+
+    out = tmp_path / "samples"
+    (out / "T000").mkdir(parents=True)
+    (out / "T001").mkdir(parents=True)
+    cfg["progat"]["output_dir"] = str(out)
+    cfg["progat"]["allow_cpu"] = False
+
+    assert discover(out, "generated") == []
+    # Having found nothing reusable it goes on to sample, and refuses here
+    # only because this host has no GPU. Returning the directory instead
+    # would be the bug.
+    with pytest.raises(runner.RunnerError, match="CUDA"):
+        asyncio.run(runner.sample(cfg, refresh=False))
+
+
+def test_a_directory_with_real_samples_is_reused(tmp_path, cfg):
+    import asyncio
+
+    from protacbench import runner
+
+    out = tmp_path / "samples"
+    (out / "T000").mkdir(parents=True)
+    (out / "T000" / "0_.xyz").write_text("1\n\nC 0.0 0.0 0.0\n")
+    cfg["progat"]["output_dir"] = str(out)
+    cfg["progat"]["allow_cpu"] = False
+
+    assert asyncio.run(runner.sample(cfg, refresh=False)) == out

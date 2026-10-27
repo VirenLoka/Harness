@@ -241,9 +241,28 @@ async def sample(
     settings = cfg["progat"]
     output_dir = resolve(cfg, settings["output_dir"])
 
-    if output_dir.is_dir() and any(output_dir.iterdir()) and not refresh:
-        LOG.info("%s already holds samples, reusing them", output_dir)
-        return output_dir
+    # Reuse only what `assess` would actually find. Testing the directory for
+    # any content at all is not the same question: an interrupted run leaves
+    # the per-PROTAC subdirectories behind without writing an XYZ into them,
+    # and the old check then reported "reusing them" for a directory that
+    # assessment reads as empty. One definition of "has samples", shared.
+    from .triage import discover
+
+    if not refresh:
+        existing = discover(output_dir, "generated")
+        if existing:
+            LOG.info(
+                "%s already holds %d sample(s), reusing them",
+                output_dir,
+                len(existing),
+            )
+            return output_dir
+        if output_dir.is_dir() and any(output_dir.iterdir()):
+            LOG.info(
+                "%s has leftover files but no readable samples, so sampling "
+                "will run again",
+                output_dir,
+            )
 
     if not settings["allow_cpu"]:
         runtime = runtime or await probe(cfg)
