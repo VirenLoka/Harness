@@ -38,8 +38,34 @@ from typing import Any
 from .reference import Profile, cleavable_motifs, nearest_similarity
 
 # Reasons a candidate is rejected outright rather than ranked low.
+# Reactive or unstable groups that have no business in an ADC spacer.
+#
+# The same gate exists in `protacbench.assess`, for the same reason -- nothing
+# else measured can see these -- but it cannot be the same check. An ADC's
+# conjugation handle is *deliberately* reactive: a maleimide is a Michael
+# acceptor, an NHS ester is an activated acyl. Those are the point. So matches
+# that overlap the declared handle are exempt, and only reactive chemistry
+# found elsewhere in the molecule counts against it.
+DISQUALIFYING_GROUPS: tuple[tuple[str, str], ...] = (
+    ("aldehyde", "[CX3H1](=O)[#6]"),
+    ("acyl_halide", "[CX3](=[OX1])[F,Cl,Br,I]"),
+    ("anhydride", "[CX3](=[OX1])[OX2][CX3]=[OX1]"),
+    ("isocyanate", "[NX2]=[CX2]=[OX1]"),
+    ("epoxide", "[CX4]1O[CX4]1"),
+    ("aziridine", "[CX4]1N[CX4]1"),
+    ("allene", "[CX2]=[CX2]=[CX2]"),
+    ("vinyl_ether", "[OX2;!$(O=*)][CX3]=[CX3]"),
+    ("enol", "[OX2H][CX3]=[CX3]"),
+    ("peroxide", "[OX2][OX2]"),
+    ("nitroso", "[NX2]=[OX1]"),
+    # Michael acceptors are listed, and the handle exemption is what keeps
+    # maleimide-based designs legal.
+    ("michael_acceptor", "[CX3]=[CX3][CX3]=[OX1]"),
+)
+
 GATES: dict[str, str] = {
     "unparseable": "RDKit could not read the SMILES",
+    "reactive_group": "a reactive or unstable group outside the conjugation handle",
     "disconnected": "the molecule is in more than one piece",
     "payload_lost": "the payload is no longer intact; this is a different drug",
     "trigger_lost": "the cleavable motif is gone, so the payload can never be released",
@@ -172,6 +198,34 @@ def _payload_query(payload_smiles: str) -> Any:
     return query
 
 
+_REACTIVE_QUERIES: list[tuple[str, Any]] = []
+
+
+def reactive_groups_outside(mol: Any, exempt: set[int]) -> list[str]:
+    """Disqualifying groups whose atoms lie outside `exempt`.
+
+    `exempt` is the conjugation handle. A match that overlaps it at all is
+    skipped, because the handle's reactivity is the design, not a defect.
+    """
+    global _REACTIVE_QUERIES
+    from rdkit import Chem
+
+    if not _REACTIVE_QUERIES:
+        _REACTIVE_QUERIES = [
+            (name, q)
+            for name, smarts in DISQUALIFYING_GROUPS
+            if (q := Chem.MolFromSmarts(smarts)) is not None
+        ]
+
+    found: list[str] = []
+    for name, query in _REACTIVE_QUERIES:
+        for match in mol.GetSubstructMatches(query):
+            if not exempt.intersection(match):
+                found.append(name)
+                break
+    return found
+
+
 def check_gates(mol: Any, context: Context, score: ADCScore) -> None:
     """Apply the non-tradeable checks. Populates `score.gates_failed`."""
     from rdkit import Chem
@@ -211,10 +265,13 @@ def check_gates(mol: Any, context: Context, score: ADCScore) -> None:
         )
 
     # Exactly one reactive handle: none cannot be conjugated, two crosslinks.
+    handle_atoms: set[int] = set()
     if context.handle_smarts:
         query = Chem.MolFromSmarts(context.handle_smarts)
         if query is not None:
             matches = mol.GetSubstructMatches(query)
+            for match in matches:
+                handle_atoms.update(match)
             if not matches:
                 score.gates_failed.append("handle_lost")
             elif len(matches) > 1:
@@ -222,6 +279,18 @@ def check_gates(mol: Any, context: Context, score: ADCScore) -> None:
                 score.gate_detail = (
                     score.gate_detail or f"{len(matches)} reactive handles"
                 )
+
+    # Reactive chemistry anywhere other than the handle. The handle's own
+    # atoms are excluded, which is what lets a maleimide -- a Michael acceptor
+    # by construction, and the single most common ADC conjugation chemistry --
+    # pass while a stray aldehyde in the spacer does not.
+    stray = reactive_groups_outside(mol, handle_atoms)
+    if stray:
+        score.gates_failed.append("reactive_group")
+        score.gate_detail = score.gate_detail or (
+            f"{', '.join(stray)} outside the conjugation handle"
+        )
+        score.properties["reactive_groups"] = ";".join(stray)
 
 
 def score_molecule(mol: Any, context: Context) -> ADCScore:

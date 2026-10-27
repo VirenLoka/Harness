@@ -200,3 +200,56 @@ def test_reason_names_the_weak_term_on_a_low_score():
         terms=[S.Term("motif_familiarity", 0.1, 25.0, "10% routine")],
     )
     assert "motif_familiarity" in S.build_reason(result)
+
+
+# ------------------------------------------------------- reactive linkers
+
+
+def test_a_free_aldehyde_in_the_linker_zeroes_liabilities():
+    """From a real run: `NCCCCCCCC=O` was the top-scoring molecule of 1024,
+    at 95/100. It is a free aldehyde that would acylate protein lysines.
+    Nothing else measured can see it -- SA rewards it for being small, QED is
+    indifferent, and the motif matcher reads it as an alkyl chain."""
+    result = scored("O=C(NCCCCCCCC=O)c1ccccc1", 10, span=9,
+                    codes=["reactive_linker_group"])
+    term = next(t for t in result.terms if t.name == "liabilities")
+    assert term.score == 0.0
+    assert "reactive" in term.note
+
+
+def test_liable_groups_cost_without_disqualifying():
+    """A click handle or a solubilising amine is a real liability and can
+    also be deliberate, so it is charged for rather than rejected."""
+    mol = Chem.MolFromSmiles("O=C(NCCC#CCCN)c1ccccc1")
+    props = molecule_properties(mol)
+    plain = S.score_sample(mol, props, {"path_length_bonds": 9}, list(range(8)), [])
+    flagged = S.score_sample(
+        mol, {**props, "liable_groups": "alkyne;primary_amine"},
+        {"path_length_bonds": 9}, list(range(8)), [],
+    )
+    assert flagged.total < plain.total
+
+
+def test_groups_are_only_flagged_inside_the_linker():
+    """A warhead is allowed to contain whatever it contains -- its structure
+    is the reason the molecule exists, and flagging it would reject samples
+    for something the generator never did."""
+    from protacbench.assess import DISQUALIFYING_GROUPS, groups_in_linker
+
+    mol = Chem.MolFromSmiles("O=Cc1ccccc1CCOCC")   # aldehyde on the aryl end
+    aryl = list(range(0, 8))
+    chain = list(range(8, mol.GetNumHeavyAtoms()))
+    assert "aldehyde" in groups_in_linker(mol, aryl, DISQUALIFYING_GROUPS)
+    assert groups_in_linker(mol, chain, DISQUALIFYING_GROUPS) == []
+
+
+def test_ordinary_protac_linkers_are_not_flagged():
+    """PEG, amide, piperazine and plain alkyl must all survive, or the gate
+    rejects the chemistry it exists to favour."""
+    from protacbench.assess import DISQUALIFYING_GROUPS, LIABLE_GROUPS, groups_in_linker
+
+    for smiles in ("CCOCCOCCOCC", "CC(=O)NCCOCC", "C1CN(CCN1)CCOCC", "CCCCCC"):
+        mol = Chem.MolFromSmiles(smiles)
+        every = list(range(mol.GetNumHeavyAtoms()))
+        assert groups_in_linker(mol, every, DISQUALIFYING_GROUPS) == [], smiles
+        assert groups_in_linker(mol, every, LIABLE_GROUPS) == [], smiles

@@ -580,3 +580,28 @@ def test_an_unknown_config_key_fails_loudly(tmp_path):
     path.write_text("reference:\n  not_a_key: 1\n")
     with pytest.raises(ConfigError, match="unknown config key"):
         load_config(path)
+
+
+def test_the_conjugation_handle_may_be_reactive(dataset):
+    """A maleimide IS a Michael acceptor -- that is the whole point of it,
+    and it is the commonest ADC conjugation chemistry. The reactive-group
+    gate must exempt the declared handle or it rejects every real design."""
+    context = make_context(dataset)
+    maleimide = (
+        "O=C1C=CC(=O)N1CCCCCC(=O)N[C@@H](C(C)C)C(=O)"
+        "N[C@@H](CCCNC(N)=O)C(=O)Nc1ccc(CO)cc1"
+    )
+    result = score.score_smiles(maleimide, context)
+    assert "reactive_group" not in result.gates_failed
+    assert result.accepted
+
+
+def test_reactive_chemistry_away_from_the_handle_is_gated(dataset):
+    context = make_context(dataset)
+    with_aldehyde = (
+        "O=C1C=CC(=O)N1CCCCC(=O)N[C@@H](C(C)C)C(=O)"
+        "N[C@@H](CCCNC(N)=O)C(=O)Nc1ccc(C=O)cc1"
+    )
+    result = score.score_smiles(with_aldehyde, context)
+    assert "reactive_group" in result.gates_failed
+    assert not result.accepted

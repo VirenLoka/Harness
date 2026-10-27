@@ -54,6 +54,12 @@ DEFAULTS: dict[str, Any] = {
         "max_clogp": 9.0,
         "max_rotatable_bonds": 30,
         "reject_pains": True,
+        # Reject a linker carrying an aldehyde, acyl halide, epoxide,
+        # Michael acceptor or other group that would react with protein
+        # nucleophiles or not survive as drawn. Nothing else measured here
+        # can see these: SA rewards them for being small, QED is
+        # indifferent, and the motif matcher reads them as ordinary chains.
+        "reject_reactive_linker": True,
         "reject_bad_linker_rings": True,
         "reject_macrocycles": True,
         "min_linker_path_bonds": 3,

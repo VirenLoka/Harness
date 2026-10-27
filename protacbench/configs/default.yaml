@@ -32,6 +32,10 @@ thresholds:
   max_clogp: 9.0
   max_rotatable_bonds: 30
   reject_pains: true
+  # Reject a linker carrying a reactive or unstable group. On a real run
+  # this re-triaged 197 of 468 otherwise-passing samples, including the
+  # top-scoring molecule, which was a free aldehyde.
+  reject_reactive_linker: true
   reject_bad_linker_rings: true
   reject_macrocycles: true
   min_linker_path_bonds: 3

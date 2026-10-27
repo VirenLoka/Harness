@@ -261,6 +261,23 @@ def score_sample(
     # a chemist would object to, so each costs a stated amount.
     penalties: list[str] = []
     value = 1.0
+
+    # A reactive linker is not a quality gradient, so this zeroes the term
+    # outright rather than nibbling at it. Without this a free aldehyde on a
+    # short chain scored 95/100 on a real run -- small, low SA, and read by
+    # the motif matcher as an ordinary alkyl chain.
+    reactive = str(properties.get("reactive_groups") or "")
+    if "reactive_linker_group" in codes or reactive:
+        value = 0.0
+        penalties.append(f"reactive group ({reactive or 'in linker'})")
+
+    # Liabilities that can be deliberate -- a click handle, a conjugation
+    # point, a solubilising amine -- cost rather than disqualify.
+    liable = [g for g in str(properties.get("liable_groups") or "").split(";") if g]
+    if liable:
+        value -= min(0.15 * len(liable), 0.45)
+        penalties.append(", ".join(liable))
+
     if "pains_alert" in codes:
         value -= 0.5
         penalties.append("PAINS alert")

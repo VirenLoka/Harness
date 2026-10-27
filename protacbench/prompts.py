@@ -69,6 +69,12 @@ REMEDIES: dict[str, str] = {
         "The converted structure could not be parsed. Propose a linker of the "
         "required length in SMILES directly."
     ),
+    "reactive_linker_group": (
+        "Replace the reactive group in the linker with a stable equivalent: "
+        "an aldehyde or ketone becomes an amide or an alcohol, a Michael "
+        "acceptor becomes the saturated chain, an epoxide becomes a diol or "
+        "an ether. Do not simply delete the atoms -- keep the linker's length."
+    ),
     "bad_linker_ring": (
         "Replace the strained or oversized ring in the linker with an "
         "open chain, or with a five- or six-membered ring."

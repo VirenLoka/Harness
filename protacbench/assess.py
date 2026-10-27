@@ -71,7 +71,50 @@ HARD_FAILURES = {
     "missing_xyz": "the generated coordinate file is absent",
 }
 
+# Functional groups that make a linker unusable, however good its descriptors
+# look. These are checked inside the linker only -- a warhead is allowed to
+# contain whatever it contains, because its structure is the reason the
+# molecule exists.
+#
+# This gate was added after a real run: of 468 samples that passed every other
+# check, 197 carried one of these, and the single highest-scoring molecule in
+# the whole run was `NCCCCCCCC=O` -- a free aldehyde on a short alkyl chain,
+# scoring 95/100 because it is small and trivially synthesisable. Nothing else
+# measured here can see that. SA rewards it, QED is indifferent, and the motif
+# matcher reads it as a perfectly ordinary alkyl chain.
+DISQUALIFYING_GROUPS: tuple[tuple[str, str], ...] = (
+    # Electrophiles that acylate or alkylate lysines and cysteines in vivo.
+    ("aldehyde", "[CX3H1](=O)[#6]"),
+    ("acyl_halide", "[CX3](=[OX1])[F,Cl,Br,I]"),
+    ("anhydride", "[CX3](=[OX1])[OX2][CX3]=[OX1]"),
+    ("isocyanate", "[NX2]=[CX2]=[OX1]"),
+    ("michael_acceptor", "[CX3]=[CX3][CX3]=[OX1]"),
+    ("epoxide", "[CX4]1O[CX4]1"),
+    ("aziridine", "[CX4]1N[CX4]1"),
+    # Unstable or tautomerising, so the drawn structure is not what you get.
+    ("allene", "[CX2]=[CX2]=[CX2]"),
+    ("vinyl_ether", "[OX2;!$(O=*)][CX3]=[CX3]"),
+    ("enol", "[OX2H][CX3]=[CX3]"),
+    ("imine", "[CX3]=[NX2;H1,H0;!$(N-a);!$(N=C-N)]"),
+    ("peroxide", "[OX2][OX2]"),
+    ("nitroso", "[NX2]=[OX1]"),
+)
+
+# Groups that are a real liability but can be deliberate -- a click handle, a
+# conjugation point, a solubilising amine. Scored down in `score.py` rather
+# than gated, because rejecting them would throw away legitimate designs.
+LIABLE_GROUPS: tuple[tuple[str, str], ...] = (
+    ("alkyne", "[CX2]#[CX2]"),
+    ("ketone", "[CX4][CX3](=[OX1])[CX4]"),
+    ("hydrazine", "[NX3;!$(N=*)][NX3;!$(N=*)]"),
+    ("free_thiol", "[SX2H]"),
+    ("primary_amine", "[NX3;H2;!$(NC=O);!$(N=*)]"),
+    ("azide", "[NX2]=[NX2+]=[NX1-]"),
+    ("disulfide", "[SX2][SX2]"),
+)
+
 SOFT_FAILURES = {
+    "reactive_linker_group": "the linker carries a reactive or unstable group",
     "sa_too_high": "harder to synthesise than the threshold allows",
     "qed_too_low": "drug-likeness below the threshold",
     "mw_out_of_range": "molecular weight outside the PROTAC range",
@@ -221,6 +264,48 @@ def pains_hits(mol: Any) -> list[str]:
     return [entry.GetDescription() for entry in entries]
 
 
+_GROUP_QUERIES: dict[int, list[tuple[str, Any]]] = {}
+
+
+def _group_queries(table: tuple[tuple[str, str], ...]) -> list[tuple[str, Any]]:
+    """Compile once; these run per molecule over thousands of molecules."""
+    cached = _GROUP_QUERIES.get(id(table))
+    if cached is not None:
+        return cached
+    from rdkit import Chem
+
+    compiled = []
+    for name, smarts in table:
+        query = Chem.MolFromSmarts(smarts)
+        if query is None:  # a bad pattern here is our bug, not the molecule's
+            raise ValueError(f"invalid SMARTS for {name}: {smarts}")
+        compiled.append((name, query))
+    _GROUP_QUERIES[id(table)] = compiled
+    return compiled
+
+
+def groups_in_linker(
+    mol: Any, linker_indices: list[int], table: tuple[tuple[str, str], ...]
+) -> list[str]:
+    """Which of `table`'s groups sit wholly inside the linker.
+
+    Wholly inside on purpose. A match that straddles the junction belongs
+    partly to a fragment, and the fragments are a warhead and an E3 ligand
+    whose structures are not ours to judge -- flagging their chemistry would
+    reject molecules for something the generator never did.
+    """
+    linker_set = set(linker_indices)
+    if not linker_set:
+        return []
+    found: list[str] = []
+    for name, query in _group_queries(table):
+        for match in mol.GetSubstructMatches(query):
+            if linker_set.issuperset(match):
+                found.append(name)
+                break
+    return found
+
+
 def implausible_linker_rings(mol: Any, linker_indices: list[int]) -> list[int]:
     """Ring sizes in the linker that a medicinal chemist would not accept.
 
@@ -287,6 +372,22 @@ def apply_soft_gates(
         if hits:
             assessment.properties["pains_hits"] = ";".join(hits[:3])
             assessment.add_failure("pains_alert", f"PAINS: {hits[0]}")
+
+    if thresholds.get("reject_reactive_linker", True):
+        reactive = groups_in_linker(mol, linker.atom_indices, DISQUALIFYING_GROUPS)
+        if reactive:
+            assessment.properties["reactive_groups"] = ";".join(reactive)
+            assessment.add_failure(
+                "reactive_linker_group",
+                f"the linker contains {', '.join(reactive)}, which would react "
+                "with protein nucleophiles or will not survive as drawn",
+            )
+
+    # Recorded whether or not it gates, because `score.py` charges for these
+    # and the repair prompt needs to name them.
+    liable = groups_in_linker(mol, linker.atom_indices, LIABLE_GROUPS)
+    if liable:
+        assessment.properties["liable_groups"] = ";".join(liable)
 
     if thresholds.get("reject_bad_linker_rings", True):
         bad = implausible_linker_rings(mol, linker.atom_indices)
