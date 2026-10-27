@@ -26,7 +26,10 @@ assess:
 # `broken`. PROTACs are deliberately outside Lipinski space, so these are wide.
 thresholds:
   max_sa_score: 6.0
-  min_qed: 0.05
+  # 0 = report QED, never gate on it. The 128 real PROTACs this test set is
+  # built from have a median QED of 0.064 and 34% fall below 0.05, so a gate
+  # there rejects a third of the ground truth.
+  min_qed: 0.0
   min_mw: 400.0
   max_mw: 1600.0
   max_clogp: 9.0

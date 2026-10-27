@@ -48,7 +48,13 @@ DEFAULTS: dict[str, Any] = {
         # Soft gates. A sample failing one is `poor`, not `broken`.
         # PROTACs are deliberately outside Lipinski space, so these are wide.
         "max_sa_score": 6.0,
-        "min_qed": 0.05,
+        # Measured, not chosen: the 128 real published PROTACs in the test
+        # set have a median QED of 0.064, and 43 of them (34%) fall below
+        # 0.05. A gate there rejects a third of the ground truth. QED scores
+        # oral-small-molecule likeness, so for a ~940 Da bifunctional
+        # degrader it measures how unlike an oral drug the molecule is --
+        # which is the wrong question. Measured and reported, never gated.
+        "min_qed": 0.0,
         "min_mw": 400.0,
         "max_mw": 1600.0,
         "max_clogp": 9.0,

@@ -253,3 +253,13 @@ def test_ordinary_protac_linkers_are_not_flagged():
         every = list(range(mol.GetNumHeavyAtoms()))
         assert groups_in_linker(mol, every, DISQUALIFYING_GROUPS) == [], smiles
         assert groups_in_linker(mol, every, LIABLE_GROUPS) == [], smiles
+
+
+def test_qed_is_not_gated_by_default():
+    """34% of the 128 real published PROTACs this test set is built from fall
+    below the old 0.05 threshold. A gate there rejects a third of the ground
+    truth, because QED scores oral-small-molecule likeness and a PROTAC is
+    ~940 Da and bifunctional by construction."""
+    from protacbench.config import load_config
+
+    assert load_config()["thresholds"]["min_qed"] == 0.0
