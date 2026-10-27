@@ -164,5 +164,26 @@ BAD_JUNCTIONS = (('dialkyl_ketone',
   '[CX3](=[OX1])[F,Cl,Br,I]',
   'an acyl halide does not survive water'),
  ('peroxide', '[OX2][OX2]', 'a peroxide is not stable enough to administer'),
- ('aldehyde', '[CX3H1](=O)[#6]', 'an aldehyde cross-links protein amines'))
+ ('aldehyde', '[CX3H1](=O)[#6]', 'an aldehyde cross-links protein amines'),
+ ('alpha_ketoamide',
+  '[NX3][CX3](=[OX1])[CX3](=[OX1])[#6]',
+  'an alpha-ketoamide is electrophilic and hydrolytically fragile. It '
+  'appears when a spacer is built onto a carbamate carbonyl, which is what '
+  'the spacer_after_cassette architecture hands a generator'),
+ ('free_thiol',
+  '[SX2H]',
+  "a free thiol in the linker caps the molecule's own maleimide, scrambles "
+  "any disulfide in the cassette, and gives albumin's Cys34 somewhere to "
+  'attach. Cap it as a thioether or remove it'),
+ ('unhindered_disulfide',
+  '[CX4;H2,H3][SX2][SX2][CX4;H2,H3]',
+  'a disulfide with no substitution on either alpha carbon is reduced by '
+  'circulating glutathione long before the conjugate reaches a cell. The '
+  'gem-dimethyl hindrance in every clinical disulfide linker exists for '
+  'exactly this reason'),
+ ('aldehyde_derived_hydrazone',
+  '[CX3;H1]=[NX2][NX3]',
+  'an aldehyde-derived hydrazone hydrolyses far too readily to survive '
+  'circulation. The acid-labile ADC trigger is a ketone-derived '
+  "acylhydrazone, as in gemtuzumab ozogamicin's AcBut linker"))
 

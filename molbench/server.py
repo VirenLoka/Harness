@@ -1291,6 +1291,35 @@ BAD_JUNCTIONS: tuple[tuple[str, str, str], ...] = (
         "[CX3H1](=O)[#6]",
         "an aldehyde cross-links protein amines",
     ),
+    (
+        "alpha_ketoamide",
+        "[NX3][CX3](=[OX1])[CX3](=[OX1])[#6]",
+        "an alpha-ketoamide is electrophilic and hydrolytically fragile. It "
+        "appears when a spacer is built onto a carbamate carbonyl, which is "
+        "what the spacer_after_cassette architecture hands a generator",
+    ),
+    (
+        "free_thiol",
+        "[SX2H]",
+        "a free thiol in the linker caps the molecule's own maleimide, "
+        "scrambles any disulfide in the cassette, and gives albumin's Cys34 "
+        "somewhere to attach. Cap it as a thioether or remove it",
+    ),
+    (
+        "unhindered_disulfide",
+        "[CX4;H2,H3][SX2][SX2][CX4;H2,H3]",
+        "a disulfide with no substitution on either alpha carbon is reduced "
+        "by circulating glutathione long before the conjugate reaches a "
+        "cell. The gem-dimethyl hindrance in every clinical disulfide linker "
+        "exists for exactly this reason",
+    ),
+    (
+        "aldehyde_derived_hydrazone",
+        "[CX3;H1]=[NX2][NX3]",
+        "an aldehyde-derived hydrazone hydrolyses far too readily to survive "
+        "circulation. The acid-labile ADC trigger is a ketone-derived "
+        "acylhydrazone, as in gemtuzumab ozogamicin's AcBut linker",
+    ),
 )
 
 _ADC_QUERY_CACHE: dict[str, Chem.Mol] = {}
@@ -1723,6 +1752,39 @@ def check_payload_release(
             "adduct -- it is how trastuzumab emtansine works -- and a "
             "mistake otherwise"
         )
+
+    # A p-aminobenzyl spacer that is wired wrong does nothing, and looks
+    # exactly like one that is wired right. Three ways it fails silently,
+    # each checked only when a benzylic spacer is actually present.
+    benzylic = _adc_query("[CH2;$([CH2][OX2,NX3])]c1ccc([#7])cc1")
+    if mol.HasSubstructMatch(benzylic):
+        if mol.HasSubstructMatch(
+            _adc_query(
+                "[NX3;!$([NX3][CX3]=[OX1]);!$([NX3+])]"
+                "c1ccc([CH2][OX2][CX3]=[OX1])cc1"
+            )
+        ):
+            issues.append(
+                "the p-aminobenzyl spacer's aniline nitrogen is not an "
+                "amide, so no protease can arm it. The 1,6-elimination "
+                "starts when that amide is cleaved and the nitrogen's lone "
+                "pair is freed; a free amine, a sulfonamide or a urea there "
+                "never triggers"
+            )
+        if mol.HasSubstructMatch(
+            _adc_query(
+                "[CX3](=[OX1])[NX3;H1]c1ccc([CH2]"
+                "[NX3;!$([NX3][CX3]=[OX1]);!$([NX4+])])cc1"
+            )
+        ):
+            issues.append(
+                "the payload is joined to the p-aminobenzyl spacer as a "
+                "benzylamine rather than through a carbamate. A neutral "
+                "amine is a poor leaving group at a benzylic position; the "
+                "carbamate exists because it fragments to carbon dioxide "
+                "plus the free payload amine. Draw it Ar-CH2-O-C(=O)-N"
+                "(payload)"
+            )
 
     if triggers and not releasing:
         issues.append(

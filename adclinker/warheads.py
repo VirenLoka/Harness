@@ -187,11 +187,29 @@ PAYLOADS: dict[str, Payload] = {
     ),
     "dxd": Payload(
         "dxd",
-        "[*:1]NC[C@@H]1C[C@@H]2c3nc4cc(F)ccc4c(C)c3C[C@H](O)[C@]2(O)C1=O",
-        "primary amine",
-        "A simplified deruxtecan-like topoisomerase I inhibitor stand-in. "
-        "Replace with your exact payload before use; this is a placeholder "
-        "that is the right size and polarity, not the real DXd.",
+        "CC[C@@]1(O)C(=O)OCc2c1cc1n(c2=O)Cc2c-1nc1cc(F)c(C)c3c1c2"
+        "[C@@H](NC(=O)CO[*:1])CC3",
+        "the glycolamide hydroxyl",
+        "The real DXd: exatecan bearing the glycolamide that trastuzumab "
+        "deruxtecan releases. The linker attaches at the glycolamide oxygen "
+        "through an aminomethylene acetal, which collapses once the GGFG "
+        "tetrapeptide in front of it is cut.\n\n"
+        "This entry replaces a placeholder that was neither DXd nor a "
+        "camptothecin: MW 330 against the real 493, four rings against six, "
+        "and no alpha-hydroxy-delta-lactone at all. That lactone IS the "
+        "pharmacophore -- it is what traps the topoisomerase I cleavage "
+        "complex -- so the placeholder would have had every design built "
+        "around a molecule that cannot kill anything. Taken from the "
+        "verified structure of Enhertu in tests/data/approved_adcs.json.",
+    ),
+    "exatecan": Payload(
+        "exatecan",
+        "CC[C@@]1(O)C(=O)OCc2c1cc1n(c2=O)Cc2c-1nc1cc(F)c(C)c3c1c2"
+        "[C@@H]([*:1])CC3",
+        "the C1 primary amine",
+        "Exatecan itself, attached through its amine rather than through a "
+        "glycolamide. Use when you want the spacer to carry the whole "
+        "release chemistry instead of inheriting deruxtecan's.",
     ),
 }
 
