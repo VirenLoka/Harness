@@ -1,0 +1,89 @@
+# Assessment and triage of DiffPROTAC -> Pro-GAT samples.
+
+progat:
+  repo_path: ../Pro-GAT
+  python: null              # interpreter with Pro-GAT's deps; null = this one
+  model_path: checkpoints/protacs_best.ckpt
+  repair_model: repair_model/ckpt/best_repair_model.pt
+  data_path: datasets
+  test_data_prefix: protacs_test
+  # 0 = each PROTAC's own reference linker length (3-37, median 13 in the test
+  # set). A positive value forces every entry to that length.
+  linker_size: 0
+  n_samples: 10
+  batch_size: 64
+  output_dir: runs/samples
+  timeout_s: 21600.0
+  allow_cpu: false          # 500 diffusion steps on CPU is not practical
+
+assess:
+  stages: [generated, repaired]   # both, so the Pro-GAT delta is visible
+  repaired_dir: ../Pro-GAT/repaired   # where inference_repair.py writes
+  sdf_dir: runs/sdf
+  workers: 8
+
+# Soft gates. Failing one makes a sample `poor`; failing a hard gate makes it
+# `broken`. PROTACs are deliberately outside Lipinski space, so these are wide.
+thresholds:
+  max_sa_score: 6.0
+  min_qed: 0.05
+  min_mw: 400.0
+  max_mw: 1600.0
+  max_clogp: 9.0
+  max_rotatable_bonds: 30
+  reject_pains: true
+  reject_bad_linker_rings: true
+  reject_macrocycles: true
+  min_linker_path_bonds: 3
+  max_linker_path_bonds: 40
+
+report:
+  output_dir: runs/report
+  samples_csv: samples.csv
+  rejects_csv: rejects.csv
+  summary_json: summary.json
+  repair_tasks: repair_tasks.jsonl
+  repair_verdicts: [broken, poor]
+
+run:
+  log_dir: runs/logs
+  log_level: INFO
+  log_to_file: true
+  progress: auto
+
+# Driving the DeepSeek harness headlessly to repair rejected samples.
+# Nothing here is a secret: the API key is read from the environment variable
+# named in model.api_key_env and never written into the generated patch.
+harness:
+  node_bin: npx
+  dsh_package: "@deepseek-ai/dsh@0.2.0-rc.2"
+  profile: headless           # headless is a profile, not a flag
+  dsh_home: null              # null keeps DSH_HOME as the environment has it
+  cwd: .
+  molbench_path: ../molbench
+  molbench_python: null       # null = molbench/.venv/bin/python when present
+  model:
+    provider: local           # route name agent-default-model points at
+    name: muse-glimmer-30b
+    base_url: http://127.0.0.1:8000/v1   # the local gateway from serve.py
+    api_key_env: VLLM_API_KEY
+    api: openai-completions
+    context_window: 131072
+    max_tokens: 8192
+  # read-only | workspace-write | danger-full-access. Repair touches no files,
+  # so the restrictive default is fine; raise it only if a tool call turns out
+  # to need an escalation the harness then refuses.
+  permission_mode: workspace-write
+  require_api_key: true
+  timeout_s: 900.0            # the harness has no timeout of its own
+  tool_timeout_s: 120.0
+  patch_file: runs/harness/molbench.patch.yml
+
+repair:
+  tasks_file: runs/report/repair_tasks.jsonl
+  output_dir: runs/repair
+  results_jsonl: results.jsonl
+  repaired_csv: repaired.csv
+  summary_json: summary.json
+  workers: 2                  # each worker is a Node process plus an MCP server
+  retries: 1

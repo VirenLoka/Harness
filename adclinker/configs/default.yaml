@@ -1,0 +1,66 @@
+# ADC linker generation: reference data, warheads, REINVENT, scoring.
+#
+# Every threshold in the scoring function is measured from reference.dataset
+# rather than chosen, so pointing that elsewhere recalibrates the whole run.
+# Paths are relative to the adclinker package directory.
+
+reference:
+  dataset: ../Linker-GPT/data/linkers.csv
+  smiles_column: smiles
+  cache: runs/reference_profile.json
+  fingerprint_radius: 2
+  fingerprint_bits: 2048
+design:
+  handle: maleimidocaproyl
+  cassette: val_cit_pab
+  payload: mmae
+  architecture: spacer_before_cassette
+  all_cassettes: false
+reinvent:
+  executable: reinvent
+  repo_path: ../REINVENT4
+  prior_file: ../REINVENT4/priors/linkinvent.prior
+  model_file: null
+  device: cpu
+  working_dir: runs
+  num_smiles: 200
+  unique_molecules: true
+  randomize_smiles: true
+  temperature: 1.0
+  sampling_config: runs/sampling.toml
+  warheads_file: runs/warheads.smi
+  samples_csv: runs/samples.csv
+  timeout_s: 7200.0
+finetune:
+  config_file: runs/transfer_learning.toml
+  training_file: runs/tl_train.smi
+  validation_file: runs/tl_valid.smi
+  output_model: runs/linkinvent_adc.model
+  num_epochs: 20
+  batch_size: 64
+  sample_batch_size: 100
+  save_every_n_epochs: 5
+  learning_rate: 0.0001
+  lr_step: 5
+  lr_gamma: 0.9
+  validation_fraction: 0.1
+  min_linker_atoms: 3
+  max_linker_atoms: 30
+  min_warhead_atoms: 3
+  max_pairs_per_molecule: 6
+  seed: 42
+scoring_plugin:
+  plugin_root: plugins
+score:
+  require_cleavable: true
+  min_heavy_atoms: 12
+report:
+  output_dir: runs/report
+  candidates_csv: candidates.csv
+  summary_json: summary.json
+  top_n: 200
+run:
+  log_dir: runs/logs
+  log_level: INFO
+  log_to_file: true
+  progress: auto
