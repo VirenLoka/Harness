@@ -89,7 +89,13 @@ DEFAULTS: dict[str, Any] = {
         # A gate: reject anything with no lysosomal release motif. Turn off
         # only when deliberately designing a non-cleavable linker.
         "require_cleavable": True,
-        "min_heavy_atoms": 12,
+        # 6, because that is below everything real rather than a number
+        # chosen for feel. The smallest linker in the 1,692 reference
+        # reagents is 7 heavy atoms; the smallest among the 16 approved ADCs
+        # is 11 (Elahere's sulfo-SPDB). A floor of 12 sat above both and
+        # rejected Elahere. This one fires only on a degenerate linker --
+        # two or three atoms, which means the generation failed.
+        "min_heavy_atoms": 6,
     },
     "report": {
         "output_dir": "runs/report",

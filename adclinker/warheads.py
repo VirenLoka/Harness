@@ -119,11 +119,21 @@ CASSETTES: dict[str, Cassette] = {
     ),
     "ggfg": Cassette(
         "ggfg",
-        "[*:1]C(=O)CNC(=O)CNC(=O)[C@H](Cc1ccccc1)NC(=O)CN[*:2]",
+        "[*:1]C(=O)NCC(=O)NCC(=O)N[C@@H](Cc1ccccc1)C(=O)NCC(=O)NC[*:2]",
         True,
         "cathepsin",
-        "The trastuzumab deruxtecan tetrapeptide. Cleaved in the lysosome and "
-        "tolerant of high drug-to-antibody ratios because it is very polar.",
+        "The trastuzumab deruxtecan tetrapeptide, ending in the "
+        "aminomethylene that collapses once the peptide is cut. Cleaved in "
+        "the lysosome and tolerant of high drug-to-antibody ratios because it "
+        "is very polar.\n\n"
+        "This was previously written with the tetrapeptide running C-to-N "
+        "from the antibody -- the peptide reversed. A protease reads "
+        "directionality, so a reversed Gly-Gly-Phe-Gly is not a cathepsin "
+        "substrate at all, and nothing downstream could see it: the assembled "
+        "molecule had the right formula and the right mass. Rewritten from "
+        "the verified structure of Enhertu in tests/data/approved_adcs.json, "
+        "which runs Gly-Gly-Phe-Gly N-to-C from the antibody toward the "
+        "payload.",
     ),
     "disulfide": Cassette(
         "disulfide",
@@ -236,8 +246,22 @@ ARCHITECTURES: dict[str, str] = {
     "spacer_after_cassette": (
         "Warhead 1 is handle plus cassette; warhead 2 is the bare payload. "
         "The generated spacer sits between the self-immolative group and the "
-        "payload. A real but less common architecture, and worth running "
-        "alongside the default because it explores different chemistry."
+        "payload.\n\n"
+        "CURRENTLY USABLE ONLY WITH THE HYDRAZONE CASSETTE. The architecture "
+        "is real -- it is how several clinical linkers are built -- but it "
+        "cannot be expressed with the cassettes as they are written here. "
+        "Both the acyl handles and the peptide cassettes present their "
+        "attachment on a carbonyl carbon, on the understanding that the "
+        "other side supplies the nitrogen. Joining them directly therefore "
+        "puts two carbonyls together and makes an alpha-ketoamide: it "
+        "sanitises, it has the right mass, and it is an electrophile that "
+        "will not survive plasma. `build_pair` now refuses those "
+        "combinations instead of returning them.\n\n"
+        "Making this architecture general needs the cassettes rewritten to "
+        "present a nitrogen on the antibody side, with the spacer supplying "
+        "the acyl when it sits in front instead. That is a change to every "
+        "cassette and to what a generated spacer has to end in, so it is "
+        "left undone rather than half-done."
     ),
 }
 
@@ -257,6 +281,19 @@ IMPLAUSIBLE_JUNCTIONS: tuple[tuple[str, str], ...] = (
         "[NX3]([CX3]=[OX1])([CX3]=[OX1])[CX3]=[OX1]",
 
     ),
+    # Acyl bonded straight to acyl. Both the acyl handles and the peptide
+    # cassettes expose their attachment on a carbonyl carbon -- "I supply the
+    # acyl, you supply the nitrogen" -- so joining them directly, which is
+    # exactly what `spacer_after_cassette` does, puts two carbonyls together
+    # and makes an alpha-ketoamide. It sanitises, it has the right mass, and
+    # it is an electrophile that will not survive plasma.
+    ("alpha_ketoamide", "[NX3][CX3](=[OX1])[CX3](=[OX1])[#6]"),
+    # A ketone where an amide was intended, from an acyl meeting a carbon.
+    ("dialkyl_ketone", "[CX4][CX3](=[OX1])[CX4]"),
+    # Sulfur bonded to nitrogen, which is what a disulfide cassette joined to
+    # an amine payload produces. A disulfide linker needs a THIOL payload --
+    # DM1 and DM4 carry one, the auristatins do not.
+    ("sulfenamide", "[SX2][NX3]"),
     ("anhydride", "[CX3](=[OX1])[OX2][CX3]=[OX1]"),
     ("acyl_halide", "[CX3](=[OX1])[F,Cl,Br,I]"),
     ("gem_diol", "[CX4]([OX2H])[OX2H]"),
@@ -384,6 +421,21 @@ def assemble(linker: str, pair: WarheadPair) -> str:
 
     The linker arrives with two unmapped attachment points. They are numbered
     by order of appearance, which is the order LinkInvent itself uses.
+
+    **This deliberately does not reject a bad junction, though it could.**
+    Both junctions in the finished molecule are ones the generated spacer
+    made, and a spacer starting with a carbon turns an acyl handle into a
+    ketone where an amide was intended. Raising here was tried and was
+    wrong: `_score_samples` drops any sample that fails to rebuild, so every
+    carbon-starting spacer vanished before it was ever scored -- and that is
+    the most fixable defect in the set, repaired by prepending one nitrogen.
+    Dropping it loses a candidate; scoring it produces a repair task.
+
+    So the junction is caught downstream by the `bad_junction` gate in
+    `score.py`, which rejects the molecule, records what is wrong with it,
+    and routes it to the repair loop. `build_pair` still raises, because a
+    handle and cassette that cannot join is a configuration error rather than
+    a candidate, and it happens once at setup instead of per sample.
     """
     from rdkit import Chem
 

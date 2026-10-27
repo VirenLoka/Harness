@@ -43,6 +43,7 @@ def _profile(cfg: dict[str, Any], refresh: bool = False) -> reference.Profile:
         resolve(cfg, cfg["reference"]["dataset"]),
         cache=resolve(cfg, cfg["reference"]["cache"]),
         refresh=refresh,
+        column=cfg["reference"]["smiles_column"],
     )
 
 

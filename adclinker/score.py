@@ -115,7 +115,10 @@ GATES: dict[str, str] = {
     ),
     "handle_lost": "no reactive handle, so it cannot be conjugated",
     "handle_duplicated": "more than one reactive handle, which would crosslink",
-    "too_small": "smaller than any linker in the reference set",
+    "too_small": (
+        "the linker is shorter than any in the reference set, which holds "
+        "the cassette flat against the antibody where no protease can reach it"
+    ),
 }
 
 # name -> (weight, what it is for)
@@ -228,7 +231,11 @@ class Context:
     payload_smiles: str | None = None  # with its attachment dummy removed
     handle_smarts: str | None = None
     require_cleavable: bool = True
-    min_heavy_atoms: int = 12
+    # 6, not 12. The smallest linker among the 1,692 reference reagents is 7
+    # heavy atoms and the smallest among the 16 approved ADCs is 11
+    # (Elahere's sulfo-SPDB), so a floor of 12 sat above both and rejected a
+    # marketed drug. This one fires only on a degenerate linker.
+    min_heavy_atoms: int = 6
 
 
 def _payload_query(payload_smiles: str) -> Any:
@@ -366,7 +373,12 @@ def reactive_groups_outside(mol: Any, exempt: set[int]) -> list[str]:
     found: list[str] = []
     for name, query in _REACTIVE_QUERIES:
         for match in mol.GetSubstructMatches(query):
-            if not exempt.intersection(match):
+            # Containment, not overlap. Exempting anything that merely
+            # TOUCHES the handle waves through reactive chemistry sitting at
+            # the handle's own junction -- an anhydride sharing one carbonyl
+            # with an NHS ester, say -- which is where a generator is most
+            # likely to put it.
+            if not exempt.issuperset(match):
                 found.append(name)
                 break
     return found
@@ -382,12 +394,6 @@ def check_gates(mol: Any, context: Context, score: ADCScore) -> None:
         score.gate_detail = f"the molecule is in {len(pieces)} pieces"
         return
 
-    if mol.GetNumHeavyAtoms() < context.min_heavy_atoms:
-        score.gates_failed.append("too_small")
-        score.gate_detail = (
-            f"{mol.GetNumHeavyAtoms()} heavy atoms, below the floor of "
-            f"{context.min_heavy_atoms}"
-        )
 
     # The payload must survive unchanged. A generator or an LLM that
     # "improves" the molecule by editing the drug has produced something that
@@ -428,6 +434,23 @@ def check_gates(mol: Any, context: Context, score: ADCScore) -> None:
                         "the payload sits between two parts of the linker "
                         "rather than at its end"
                     )
+
+    # The length floor, measured on the LINKER.
+    #
+    # This compared the whole conjugate against a floor of 12 heavy atoms, so
+    # it could never fire: a conjugate carrying any real payload clears 12 on
+    # the payload alone. The number was always meant to describe the linker,
+    # and a linker shorter than this holds the cassette flat against the
+    # antibody surface where the protease cannot reach its substrate.
+    linker_atoms = [
+        i for i in range(mol.GetNumAtoms()) if i not in set(score.payload_atoms)
+    ]
+    if score.payload_atoms and len(linker_atoms) < context.min_heavy_atoms:
+        score.gates_failed.append("too_small")
+        score.gate_detail = score.gate_detail or (
+            f"the linker is {len(linker_atoms)} heavy atoms, below the floor "
+            f"of {context.min_heavy_atoms}"
+        )
 
     # The release trigger. Without it a cleavable design never releases, and
     # no descriptor would reveal that.
@@ -523,7 +546,7 @@ def check_gates(mol: Any, context: Context, score: ADCScore) -> None:
     junctions: list[str] = []
     for name, smarts, _why in chemistry.BAD_JUNCTIONS:
         for match in mol.GetSubstructMatches(_cached_query(smarts)):
-            if linker_only.issuperset(match) and not handle_atoms.intersection(match):
+            if linker_only.issuperset(match) and not handle_atoms.issuperset(match):
                 junctions.append(name)
                 break
     if junctions:

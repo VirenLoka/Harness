@@ -39,6 +39,7 @@ from __future__ import annotations
 import csv
 import json
 import statistics
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -169,14 +170,20 @@ def measure(mol: Any) -> dict[str, float]:
     }
 
 
-_QUERY_CACHE: dict[int, list[tuple[str, Any]]] = {}
+_QUERY_CACHE: dict[tuple[tuple[str, str], ...], list[tuple[str, Any]]] = {}
 
 
 def _compiled(pairs: tuple[tuple[str, str], ...]) -> list[tuple[str, Any]]:
     """Compile once and keep. These are matched per molecule over thousands
     of molecules, and recompiling the SMARTS each time dominated the runtime.
     """
-    cached = _QUERY_CACHE.get(id(pairs))
+    # Keyed on the patterns themselves, not on id(pairs). An id is unique
+    # only among live objects, so once a caller's tuple is collected a later
+    # tuple can land on the same address and silently receive the wrong
+    # compiled queries. These tables are module-level constants today, which
+    # is the only reason it never bit.
+    key = pairs
+    cached = _QUERY_CACHE.get(key)
     if cached is not None:
         return cached
 
@@ -188,7 +195,7 @@ def _compiled(pairs: tuple[tuple[str, str], ...]) -> list[tuple[str, Any]]:
         if query is None:  # a bad pattern here is our bug, not the molecule's
             raise ReferenceError(f"invalid SMARTS for {name}: {smarts}")
         out.append((name, query))
-    _QUERY_CACHE[id(pairs)] = out
+    _QUERY_CACHE[key] = out
     return out
 
 
@@ -285,7 +292,10 @@ def build_profile(path: str | Path, column: str = "smiles") -> Profile:
 
 
 def load_profile(
-    dataset: str | Path, cache: str | Path | None = None, refresh: bool = False
+    dataset: str | Path,
+    cache: str | Path | None = None,
+    refresh: bool = False,
+    column: str = "smiles",
 ) -> Profile:
     """Build the profile, or read it back from a cached JSON.
 
@@ -296,6 +306,22 @@ def load_profile(
     cache_path = Path(cache) if cache else None
     if cache_path and cache_path.is_file() and not refresh:
         raw = json.loads(cache_path.read_text())
+        # The cache records which file it was built from. Without this check
+        # the cache branch is taken on the file's existence alone, so
+        # repointing reference.dataset silently keeps serving the old
+        # profile -- and every threshold downstream then describes a dataset
+        # that is not the one configured.
+        stored = raw.get("source", "")
+        if stored and stored != str(Path(dataset).resolve()):
+            warnings.warn(
+                f"cached profile at {cache_path} was built from {stored}, "
+                f"not {Path(dataset).resolve()}; rebuilding",
+                stacklevel=2,
+            )
+            raw = None
+    else:
+        raw = None
+    if raw is not None:
         profile = Profile(
             n_total=raw["n_total"],
             n_unique=raw["n_unique"],
@@ -315,7 +341,7 @@ def load_profile(
         }
         return profile
 
-    profile = build_profile(dataset)
+    profile = build_profile(dataset, column)
     if cache_path:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(profile.as_dict(), indent=2) + "\n")

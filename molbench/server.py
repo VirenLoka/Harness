@@ -1141,7 +1141,10 @@ ADC_HANDLES: dict[str, tuple[str, str]] = {
         "normally drawn and sold -- as the free acid -- so it counts as a "
         "handle even though it is not itself reactive",
     ),
-    "dbco": ("C#Cc1ccccc1", "an engineered azide, strain-promoted"),
+    "dbco": (
+        "N1C(=O)c2ccccc2C#Cc2ccccc21",
+        "an engineered azide, strain-promoted",
+    ),
     "bcn": ("C1CC2CCC1C#C2", "an engineered azide, strain-promoted"),
     "tetrazine": ("c1nnc(nn1)", "a trans-cyclooctene tag"),
     "azide": ("[NX2]=[NX2+]=[NX1-]", "a strained alkyne"),
@@ -1542,7 +1545,9 @@ def check_adc_linker(
         for match in mol.GetSubstructMatches(_adc_query(smarts)):
             if not linker_set.issuperset(match):
                 continue
-            if handle_atoms.intersection(match):
+            # Containment, not overlap: a junction that merely touches the
+            # handle is still a junction the spacer made.
+            if handle_atoms.issuperset(match):
                 continue  # the handle is meant to be reactive
             bad_junctions.append(name)
             issues.append(f"the linker contains a {name}: {why}")

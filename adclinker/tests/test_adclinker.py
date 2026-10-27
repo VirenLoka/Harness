@@ -183,21 +183,69 @@ def test_a_bare_maleimide_will_not_be_acylated_directly():
         wh.build_pair("maleimide", "val_cit_pab", "mmae", "spacer_after_cassette")
 
 
-def test_the_same_combination_is_fine_with_a_caproyl_spacer():
-    pair = wh.build_pair(
-        "maleimidocaproyl", "val_cit_pab", "mmae", "spacer_after_cassette"
-    )
-    assert pair.first and pair.second
+def test_a_caproyl_spacer_does_not_rescue_the_after_cassette_architecture():
+    """The caproyl spacer fixes the triacylamine and leaves a different
+    problem behind.
 
-
-def test_both_architectures_leave_one_attachment_point_per_warhead():
-    for architecture in wh.ARCHITECTURES:
-        pair = wh.build_pair(
-            "maleimidocaproyl", "val_cit_pab", "mmae", architecture
+    This test used to assert the combination was fine, because the only
+    junction being checked was the triacylamine. It is not fine: both the
+    acyl handles and the peptide cassettes present their attachment on a
+    carbonyl carbon, on the understanding that the other side supplies the
+    nitrogen. Joining them directly puts two carbonyls together and makes an
+    alpha-ketoamide -- which sanitises, has the right mass, and is an
+    electrophile that will not survive plasma.
+    """
+    with pytest.raises(wh.WarheadError, match="alpha_ketoamide"):
+        wh.build_pair(
+            "maleimidocaproyl", "val_cit_pab", "mmae", "spacer_after_cassette"
         )
-        for smiles in (pair.first, pair.second):
-            mol = Chem.MolFromSmiles(smiles, sanitize=False)
-            assert sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() == 0) == 1
+
+
+def test_the_default_architecture_leaves_one_attachment_point_per_warhead():
+    pair = wh.build_pair(
+        "maleimidocaproyl", "val_cit_pab", "mmae", "spacer_before_cassette"
+    )
+    for smiles in (pair.first, pair.second):
+        mol = Chem.MolFromSmiles(smiles, sanitize=False)
+        assert sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() == 0) == 1
+
+
+def test_every_buildable_combination_carries_a_live_trigger():
+    """A cassette that builds must also be recognised as cleavable.
+
+    The GGFG cassette was written with its tetrapeptide running C-to-N from
+    the antibody -- the peptide reversed. A protease reads directionality, so
+    a reversed Gly-Gly-Phe-Gly is not a cathepsin substrate, and nothing
+    downstream could see it: the molecule had the right formula and the right
+    mass, and only the trigger_lost gate fired, on every GGFG design.
+    """
+    from adclinker import chemistry
+
+    built = 0
+    for architecture in wh.ARCHITECTURES:
+        for cassette, spec in wh.CASSETTES.items():
+            if not spec.cleavable:
+                continue
+            try:
+                pair = wh.build_pair(
+                    "maleimidocaproyl", cassette, "mmae", architecture
+                )
+                assembled = wh.assemble("*NCCOCC*", pair)
+            except wh.WarheadError:
+                continue  # refused at build time, which is a result of its own
+            built += 1
+            mol = Chem.MolFromSmiles(assembled)
+            triggers = [
+                name
+                for name, smarts in chemistry.ADC_TRIGGERS
+                if mol.HasSubstructMatch(Chem.MolFromSmarts(smarts))
+            ]
+            assert triggers, (
+                f"{architecture} + {cassette} builds and assembles but "
+                "carries no recognised cleavage trigger, so trigger_lost "
+                "would reject every design made from it"
+            )
+    assert built >= 4, "too few combinations survived to be a real check"
 
 
 def test_linkinvent_input_has_no_stereochemistry():

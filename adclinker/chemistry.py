@@ -77,7 +77,8 @@ ADC_HANDLES = {'maleimide': ('O=C1C=CC(=O)N1', 'a free cysteine thiol, reversibl
                      'lysine-targeting drug-linker is normally drawn and '
                      'sold -- as the free acid -- so it counts as a handle '
                      'even though it is not itself reactive'),
- 'dbco': ('C#Cc1ccccc1', 'an engineered azide, strain-promoted'),
+ 'dbco': ('N1C(=O)c2ccccc2C#Cc2ccccc21',
+          'an engineered azide, strain-promoted'),
  'bcn': ('C1CC2CCC1C#C2', 'an engineered azide, strain-promoted'),
  'tetrazine': ('c1nnc(nn1)', 'a trans-cyclooctene tag'),
  'azide': ('[NX2]=[NX2+]=[NX1-]', 'a strained alkyne')}

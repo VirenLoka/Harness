@@ -365,6 +365,30 @@ def test_the_real_dxd_is_a_camptothecin():
     ) == pytest.approx(493.5, abs=1.0)
 
 
+@pytest.mark.parametrize("name", sorted(server.ADC_HANDLES))
+def test_each_handle_pattern_matches_its_own_handle_exactly_once(name):
+    """A handle SMARTS matching its own handle twice fails every design.
+
+    `dbco` was written as `C#Cc1ccccc1`, which describes one half of a
+    dibenzoazacyclooctyne. The alkyne is flanked by a benzo ring on BOTH
+    sides, so that pattern matches a single DBCO group twice and
+    handle_duplicated -- "a second handle crosslinks two antibodies into an
+    aggregate" -- fired on every correct DBCO candidate.
+    """
+    from adclinker import warheads as wh
+
+    if name not in wh.HANDLES:
+        pytest.skip(f"{name} has no reference structure in warheads.HANDLES")
+    smarts, _target = server.ADC_HANDLES[name]
+    mol = Chem.MolFromSmiles(wh.strip_atom_maps(wh.HANDLES[name].smiles))
+    assert mol is not None, name
+    matches = mol.GetSubstructMatches(Chem.MolFromSmarts(smarts))
+    assert len(matches) == 1, (
+        f"the {name} pattern matches one {name} group {len(matches)} times, "
+        "so handle_duplicated rejects every design that uses it"
+    )
+
+
 def test_an_unusable_payload_query_raises_rather_than_blaming_the_molecule():
     result = call(
         "check_adc_linker", {"smiles": _conjugate("*NCCOCC*"), "payload": "not a smiles"}

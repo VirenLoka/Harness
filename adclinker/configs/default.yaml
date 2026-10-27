@@ -56,7 +56,7 @@ scoring_plugin:
   plugin_root: plugins
 score:
   require_cleavable: true
-  min_heavy_atoms: 12
+  min_heavy_atoms: 6
 report:
   output_dir: runs/report
   candidates_csv: candidates.csv
