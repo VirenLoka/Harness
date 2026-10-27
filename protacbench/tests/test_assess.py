@@ -404,3 +404,128 @@ def test_a_directory_with_real_samples_is_reused(tmp_path, cfg):
     cfg["progat"]["allow_cpu"] = False
 
     assert asyncio.run(runner.sample(cfg, refresh=False)) == out
+
+
+# ------------------------------------------------------- the manual handoff
+
+
+def _row(**overrides):
+    row = {
+        "target_id": "T1", "sample_id": "0", "verdict": "poor",
+        "failure_codes": "qed_too_low", "failure_detail": "QED 0.03 below 0.05",
+        "protac_smiles": "CCOCC", "linker_smiles": "CCOCC",
+        "fragment_smiles": "c1ccccc1.c1ccncc1", "linker_size": "5",
+        "reference_smiles": "SECRET-REFERENCE-SMILES",
+        "recovers_reference": "False", "score_total": "71.5",
+        "prop_mw": "900", "prop_sa_score": "4.1", "prop_clogp": "4.4",
+        "prop_tpsa": "180", "prop_rotatable_bonds": "15",
+        "linker_heavy_atoms": "5", "linker_path_length_bonds": "6",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_the_published_answer_never_reaches_the_prompt():
+    """`reference_smiles` is the real PROTAC that target was built from. An
+    agent that sees it reads the answer off instead of repairing anything,
+    and the salvage rate then measures recall."""
+    from protacbench.prompts import build_prompt_from_row
+
+    text = build_prompt_from_row(_row(failure_codes="disconnected"))
+    assert "SECRET-REFERENCE-SMILES" not in text
+
+
+def test_the_score_is_withheld_too():
+    """A composite is gameable in a way raw descriptors are not."""
+    from protacbench.prompts import build_prompt_from_row
+
+    text = build_prompt_from_row(_row(failure_codes="disconnected"))
+    assert "71.5" not in text
+
+
+def test_qed_is_not_asked_about():
+    """The remedy for qed_too_low is "improve drug-likeness", which directly
+    contradicts the system prompt's instruction not to. The instruction is
+    the correct one -- 34% of real PROTACs fail a QED gate of 0.05 -- so a
+    stale code from an older CSV must be dropped, not rendered."""
+    from protacbench.prompts import build_prompt_from_row
+
+    text = build_prompt_from_row(_row())
+    assert "qed" not in text.lower()
+    assert "drug-likeness" not in text
+    assert "QED" not in text
+
+
+def test_classification_matches_the_optimisation_classes():
+    from protacbench.prompts import classify_row
+
+    assert classify_row(_row(verdict="broken", failure_codes="disconnected")) == "structural"
+    assert classify_row(_row(), reactive=["aldehyde"]) == "reactive"
+    assert classify_row(_row(failure_codes="pains_alert")) == "chemistry"
+    assert classify_row(_row(failure_codes="qed_too_low")) == "qed_only"
+    assert classify_row(_row(verdict="ok", failure_codes="")) == "clean"
+
+
+def test_a_prompt_states_the_fragment_constraint():
+    from protacbench.prompts import build_prompt_from_row
+
+    text = build_prompt_from_row(_row(failure_codes="disconnected"))
+    assert text.count("must survive unchanged") == 2
+
+
+def test_a_prompt_without_isolable_fragments_still_warns():
+    from protacbench.prompts import build_prompt_from_row
+
+    text = build_prompt_from_row(_row(fragment_smiles="", failure_codes="disconnected"))
+    assert "warhead" in text and "E3 ligand" in text
+
+
+def test_the_system_prompt_forbids_the_two_things_that_matter():
+    from protacbench.prompts import SYSTEM_PROMPT
+
+    assert "NOT YOURS TO CHANGE" in SYSTEM_PROMPT
+    assert "Do not\noptimise QED" in SYSTEM_PROMPT or "optimise QED" in SYSTEM_PROMPT
+    assert "REPAIRED:" in SYSTEM_PROMPT
+
+
+def test_prompts_command_skips_and_clears(tmp_path, cfg):
+    """Stale prompts from an earlier run are indistinguishable from current
+    ones once they are sitting in a folder you are working through, so the
+    directory is cleared rather than added to."""
+    import csv as _csv
+
+    from protacbench.__main__ import main
+
+    source = tmp_path / "samples.csv"
+    rows = [
+        _row(target_id="A", failure_codes="disconnected", verdict="broken"),
+        _row(target_id="B", failure_codes="qed_too_low"),              # skipped
+        _row(target_id="C", failure_codes="pains_alert"),
+        _row(target_id="D", failure_codes="pains_alert",
+             recovers_reference="True"),                                # skipped
+    ]
+    with source.open("w", newline="") as handle:
+        writer = _csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    out = tmp_path / "prompts"
+    (out / "tasks").mkdir(parents=True)
+    (out / "tasks" / "STALE-9.txt").write_text("from a previous run")
+
+    config = tmp_path / "cfg.yaml"
+    import yaml
+
+    config.write_text(
+        yaml.safe_dump({
+            "promptout": {"output_dir": str(out)},
+            "run": {"log_to_file": False},
+        })
+    )
+    assert main(["prompts", "--config", str(config), "--source", str(source),
+                 "--no-progress"]) == 0
+
+    written = sorted(p.stem for p in (out / "tasks").glob("*.txt"))
+    assert written == ["A-0", "C-0"], written
+    assert not (out / "tasks" / "STALE-9.txt").exists()
+    assert (out / "system.txt").read_text().startswith("You are a medicinal chemist")

@@ -94,3 +94,16 @@ repair:
   summary_json: summary.json
   workers: 2                  # each worker is a Node process plus an MCP server
   retries: 1
+
+# Paste-ready prompts for driving the repair by hand.
+promptout:
+  output_dir: runs/report/prompts
+  system_file: system.txt
+  tasks_jsonl: tasks.jsonl
+  manifest_csv: manifest.csv
+  # qed_only and clean are deliberately absent: the first is a threshold
+  # artefact, the second has nothing wrong with it.
+  classes: [structural, reactive, chemistry]
+  # The generator sometimes reproduces the published molecule exactly;
+  # repairing one is not a repair task.
+  skip_reference_matches: true

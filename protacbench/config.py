@@ -83,6 +83,20 @@ DEFAULTS: dict[str, Any] = {
     # Driving the DeepSeek harness headlessly to repair rejected samples.
     # Everything here is a path or an endpoint, nothing is a secret: the API
     # key is read from the environment variable named in `model.api_key_env`.
+    # Paste-ready prompts for driving the repair by hand.
+    "promptout": {
+        "output_dir": "runs/report/prompts",
+        "system_file": "system.txt",
+        "tasks_jsonl": "tasks.jsonl",
+        "manifest_csv": "manifest.csv",
+        # Which optimisation classes get a prompt. `qed_only` and `clean` are
+        # deliberately absent: the first is a threshold artefact and the
+        # second has nothing wrong with it.
+        "classes": ["structural", "reactive", "chemistry"],
+        # The generator sometimes reproduces the published molecule exactly.
+        # Repairing one is not a repair task.
+        "skip_reference_matches": True,
+    },
     "harness": {
         "node_bin": "npx",
         "dsh_package": "@deepseek-ai/dsh@0.2.0-rc.2",

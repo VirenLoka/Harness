@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 from moltrain import hostcheck, logs
 
-from . import harness, repair, runner
+from . import harness, prompts, repair, runner
 from .config import ConfigError, load_config, resolve
 from .triage import assess_all, discover, write_report
 
@@ -212,8 +214,158 @@ async def _cmd_repair(cfg: dict[str, Any], args: argparse.Namespace) -> int:
     return 0
 
 
+def _reactive_in_linker(linker_smiles: str) -> list[str]:
+    """Reactive groups in a linker read back from a CSV.
+
+    Recomputed rather than read from a column, so this works on a samples.csv
+    written before the reactive-group gate existed.
+    """
+    if not linker_smiles:
+        return []
+    from rdkit import Chem, rdBase
+
+    from .assess import DISQUALIFYING_GROUPS, groups_in_linker
+
+    with rdBase.BlockLogs():
+        mol = Chem.MolFromSmiles(linker_smiles)
+    if mol is None:
+        return []
+    return groups_in_linker(mol, list(range(mol.GetNumAtoms())), DISQUALIFYING_GROUPS)
+
+
+async def _cmd_prompts(cfg: dict[str, Any], args: argparse.Namespace) -> int:
+    """Write paste-ready repair prompts, one per molecule worth optimising."""
+    settings = cfg["promptout"]
+    source = Path(args.source) if args.source else (
+        resolve(cfg, cfg["report"]["output_dir"]) / cfg["report"]["samples_csv"]
+    )
+    if not source.is_file():
+        print(
+            f"no samples at {source}. Run `python -m protacbench assess` "
+            "first, or pass --source.",
+            file=sys.stderr,
+        )
+        return 1
+
+    wanted = set(settings["classes"])
+    out_dir = resolve(cfg, settings["output_dir"])
+    task_dir = out_dir / "tasks"
+
+    # Clear the directory first. Without this, prompts from an earlier run
+    # survive for molecules this run deliberately skipped -- a stale task is
+    # indistinguishable from a current one once it is sitting in a folder you
+    # are working through, so you would send exactly the molecules you had
+    # decided to exclude.
+    if task_dir.is_dir():
+        removed = 0
+        for stale in task_dir.glob("*.txt"):
+            stale.unlink()
+            removed += 1
+        if removed:
+            LOG.info("cleared %d prompt(s) from a previous run", removed)
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    system_path = out_dir / settings["system_file"]
+    system_path.write_text(prompts.SYSTEM_PROMPT)
+
+    counts: dict[str, int] = {}
+    written = 0
+    recovered = 0
+    manifest: list[dict[str, Any]] = []
+    tasks_path = out_dir / settings["tasks_jsonl"]
+
+    with source.open(encoding="utf-8", errors="replace", newline="") as handle, \
+            tasks_path.open("w") as tasks_out:
+        for row in csv.DictReader(handle):
+            reactive = _reactive_in_linker(row.get("linker_smiles") or "")
+            group = prompts.classify_row(row, reactive)
+            counts[group] = counts.get(group, 0) + 1
+            if group not in wanted:
+                continue
+
+            # The generator sometimes reproduces the published molecule
+            # exactly. Repairing one is not a repair task -- the input is
+            # already the answer -- and acceptance test 9 would reject
+            # anything close to it. The column is read to decide this and
+            # still never reaches the prompt.
+            if settings["skip_reference_matches"] and (
+                row.get("recovers_reference") or ""
+            ).strip().lower() == "true":
+                recovered += 1
+                continue
+            if args.limit and written >= args.limit:
+                continue
+
+            text = prompts.build_prompt_from_row(row, reactive)
+            name = f"{row.get('target_id','x')}-{row.get('sample_id','x')}.txt"
+            (task_dir / name).write_text(text)
+            tasks_out.write(
+                json.dumps(
+                    {
+                        "task_id": f"{row.get('target_id')}-{row.get('sample_id')}",
+                        "target_id": row.get("target_id"),
+                        "sample_id": row.get("sample_id"),
+                        "optimisation_class": group,
+                        "failure_codes": row.get("failure_codes", ""),
+                        "reactive_groups": ";".join(reactive),
+                        "protac_smiles": row.get("protac_smiles", ""),
+                        "linker_smiles": row.get("linker_smiles", ""),
+                        "fragment_smiles": row.get("fragment_smiles", ""),
+                        "prompt": text,
+                    }
+                )
+                + "\n"
+            )
+            manifest.append(
+                {
+                    "task_id": f"{row.get('target_id')}-{row.get('sample_id')}",
+                    "optimisation_class": group,
+                    "failure_codes": row.get("failure_codes", ""),
+                    "reactive_groups": ";".join(reactive),
+                    "prompt_file": str(task_dir / name),
+                }
+            )
+            written += 1
+
+    manifest_path = out_dir / settings["manifest_csv"]
+    if manifest:
+        with manifest_path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(manifest[0]))
+            writer.writeheader()
+            writer.writerows(manifest)
+
+    print(f"read {sum(counts.values())} samples from {source}\n")
+    print("  by optimisation class:")
+    for group in sorted(counts, key=lambda g: -counts[g]):
+        mark = "  -> prompts written" if group in wanted else "     skipped"
+        print(f"    {counts[group]:>6}  {group:<12}{mark}")
+    if recovered:
+        print(
+            f"\n  skipped {recovered} sample(s) whose input already equals the\n"
+            "  published reference molecule -- those are not repair tasks."
+        )
+    print(f"\n  wrote {written} prompt(s)")
+
+    # Say it plainly: the reference molecule is the published answer, and a
+    # run that leaks it measures recall rather than repair.
+    print(
+        f"\n  withheld from every prompt: "
+        f"{', '.join(sorted(prompts.WITHHELD_COLUMNS))}\n"
+        "  reference_smiles is the real published PROTAC for that target. An\n"
+        "  agent that sees it reads the answer off instead of repairing."
+    )
+    print()
+    print(f"{'system prompt':>16}: {system_path}")
+    print(f"{'one per task':>16}: {task_dir}/")
+    print(f"{'structured':>16}: {tasks_path}")
+    if manifest:
+        print(f"{'manifest':>16}: {manifest_path}")
+    return 0
+
+
 COMMANDS = {
     "probe": _cmd_probe,
+    "prompts": _cmd_prompts,
     "plan": _cmd_plan,
     "sample": _cmd_sample,
     "assess": _cmd_assess,
@@ -231,6 +383,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=None, help="cap the sample count")
     parser.add_argument(
         "--refresh", action="store_true", help="redo work already on disk"
+    )
+    parser.add_argument(
+        "--source", default=None, help="read samples from this CSV instead"
     )
     parser.add_argument("--json", action="store_true", help="also dump JSON")
     logs.add_cli_flags(parser)

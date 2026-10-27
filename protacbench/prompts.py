@@ -249,3 +249,216 @@ def write_tasks(path: Any, assessments: list[Assessment]) -> int:
         for assessment in assessments:
             handle.write(json.dumps(build_task(assessment)) + "\n")
     return len(assessments)
+
+
+# --------------------------------------------------------- the manual handoff
+
+# Columns that must never reach the agent. `reference_smiles` is the real
+# published PROTAC each target was built from: hand it over and the agent
+# reads the answer off instead of repairing anything, and the salvage rate
+# measures recall rather than chemistry. The score columns are withheld for a
+# softer reason -- a composite is gameable in a way raw descriptors are not,
+# and the agent should be fixing the molecule rather than the number.
+WITHHELD_COLUMNS = frozenset(
+    {
+        "reference_smiles",
+        "recovers_reference",
+        "score_total",
+        "score_reason",
+        "rank",
+    }
+)
+
+# Given once, as the agent's standing instruction. The two paragraphs that
+# earn their place are the fragment prohibition and the explicit refusal of
+# drug-likeness: without the second, an agent does the natural thing and
+# optimises QED, which for a 940 Da bifunctional degrader makes it worse at
+# its job. 34% of the real PROTACs in the test set fail a QED gate of 0.05.
+SYSTEM_PROMPT = """\
+You are a medicinal chemist optimising the linker of a PROTAC.
+
+A PROTAC has three parts: a warhead that binds a target protein, an
+E3-ubiquitin-ligase ligand, and a linker joining them. It works by holding
+both proteins together in a ternary complex, so the linker's length and
+composition decide whether it functions at all.
+
+THE TWO FRAGMENTS ARE NOT YOURS TO CHANGE. The warhead and the E3 ligand are
+the reason the molecule exists; their structures came from medicinal
+chemistry programmes, not from a generator. You may only edit the linker
+between them. A molecule that scores better because you deleted or altered a
+fragment is a different compound and will be rejected.
+
+You are NOT making this molecule drug-like in the oral small-molecule sense.
+PROTACs are around 900 Da and violate Lipinski by construction. Do not
+optimise QED. Do not reduce molecular weight toward typical drug ranges.
+Doing either makes the molecule worse at its job.
+
+WHAT A GOOD LINKER LOOKS LIKE, measured from 128 published PROTACs and from
+the passing samples of this run:
+  - spans 8 to 13 bonds between the two fragments, never below 7 or above 17
+  - 8 to 14 heavy atoms
+  - built from chemistry a lab runs routinely: amide, PEG ether, short alkyl,
+    piperazine, piperidine, triazole, sulfonamide, carbamate
+  - SA score at or below 4.9
+  - cLogP between 3.5 and 5.6
+  - TPSA at or above 170
+  - contains NO reactive or unstable group: no aldehyde, in-chain ketone,
+    imine, Michael acceptor, epoxide, aziridine, acyl halide, anhydride,
+    vinyl ether, enol, allene, peroxide or nitroso. These react with protein
+    lysines and cysteines in vivo, or do not survive as drawn.
+
+TOOLS available to you:
+  mcp__molbench__validate_smiles(smiles)
+  mcp__molbench__get_molecule_metrics(smiles)
+  mcp__molbench__apply_smarts_reaction(smiles, reaction_smarts)
+  mcp__molbench__generate_3d_conformer(smiles)
+
+MEASUREMENT DISCIPLINE. Never state a number you did not get from a tool. If
+you believe a change lowered cLogP, call get_molecule_metrics and read it.
+Make ONE change at a time and re-measure after each. An unmeasured claim is
+treated as false.
+
+HOW TO WORK:
+  1. validate_smiles on the input, to see how it parses.
+  2. get_molecule_metrics, to confirm the starting values.
+  3. Identify the smallest edit to the linker that addresses the stated
+     problem. Prefer replacing a group over rebuilding the linker.
+  4. Apply it, re-measure, and check it did not break something else.
+  5. Repeat until the problem is fixed, or until you have tried three
+     distinct approaches.
+  6. validate_smiles on your final answer before reporting it.
+
+FINISH your reply with exactly one line, and nothing after it:
+
+REPAIRED: <the full repaired PROTAC SMILES>
+
+If you cannot repair it without changing a fragment, finish with:
+
+REPAIRED: none
+
+and say above that line what you tried and why it failed. A truthful failure
+is worth more than a molecule that scores well by cheating.
+"""
+
+ROW_TEMPLATE = """\
+Repair the linker of PROTAC {target_id}, sample {sample_id}.
+
+WHAT IS WRONG
+{problems}
+
+THE MOLECULE
+  Full PROTAC: {protac_smiles}
+  Linker only: {linker_smiles}
+{fragments}
+
+AS MEASURED
+  MW {mw}            SA {sa}       cLogP {clogp}
+  TPSA {tpsa}        rotatable bonds {rotatable}
+  linker: {linker_atoms} heavy atoms spanning {span} bonds between the fragments
+{reactive}
+WHAT TO AIM FOR
+  linker span 8-13 bonds (currently {span})
+  SA at or below 4.9 (currently {sa})
+  cLogP between 3.5 and 5.6 (currently {clogp})
+  no reactive or unstable groups in the linker
+
+The linker must keep roughly its current length: {linker_size} heavy atoms.
+That length comes from the geometry of the ternary complex, not from
+preference. Shortening it to improve a descriptor breaks the molecule.
+"""
+
+
+# Failure codes that no longer gate anything and must not reach the agent.
+# `qed_too_low` carries the remedy "improve drug-likeness", which directly
+# contradicts the system prompt's instruction not to optimise QED -- and the
+# instruction is the correct one, since 34% of real published PROTACs fail a
+# QED gate of 0.05. A samples.csv written before the gate was removed still
+# carries the code, so it is dropped here rather than relied on being absent.
+SUPPRESSED_CODES = frozenset({"qed_too_low"})
+
+
+def classify_row(row: dict[str, Any], reactive: list[str] | None = None) -> str:
+    """Which optimisation class a CSV row belongs to.
+
+    `reactive` is passed in rather than recomputed so a caller that already
+    has it does not pay for the substructure search twice.
+    """
+    codes = {c for c in (row.get("failure_codes") or "").split(";") if c}
+    if (row.get("verdict") or "") == "broken":
+        return "structural"
+    if reactive or "reactive_linker_group" in codes:
+        return "reactive"
+    if codes - {"qed_too_low"}:
+        return "chemistry"
+    if codes == {"qed_too_low"}:
+        return "qed_only"
+    return "clean"
+
+
+def build_prompt_from_row(
+    row: dict[str, Any], reactive: list[str] | None = None
+) -> str:
+    """The per-task prompt for one CSV row, with the answer columns withheld."""
+    codes = [
+        c
+        for c in (row.get("failure_codes") or "").split(";")
+        if c and c not in SUPPRESSED_CODES
+    ]
+    lines = []
+    for code in codes:
+        what = HARD_FAILURES.get(code) or SOFT_FAILURES.get(code) or code
+        remedy = REMEDIES.get(code)
+        lines.append(f"- {code}: {what}." + (f" {remedy}" if remedy else ""))
+    if reactive:
+        lines.append(
+            f"- reactive_linker_group: the linker contains "
+            f"{', '.join(reactive)}. {REMEDIES['reactive_linker_group']}"
+        )
+    detail = "; ".join(
+        part.strip()
+        for part in (row.get("failure_detail") or "").split(";")
+        if part.strip() and "QED" not in part
+    )
+    if detail:
+        lines.append(f"- detail: {detail}")
+    problems = "\n".join(lines) or "- no failure was recorded"
+
+    pieces = [p for p in (row.get("fragment_smiles") or "").split(".") if p]
+    if pieces:
+        fragments = "\n".join(
+            f"  Fragment {i}:  {p}    <- must survive unchanged"
+            for i, p in enumerate(pieces, start=1)
+        )
+    else:
+        fragments = (
+            "  (the fragments could not be isolated; do not alter anything "
+            "that looks like a warhead or an E3 ligand)"
+        )
+
+    def value(key: str, fallback: str = "not measured") -> str:
+        raw = (row.get(key) or "").strip()
+        return raw if raw else fallback
+
+    reactive_line = (
+        f"  reactive groups in the linker: {', '.join(reactive)}\n"
+        if reactive
+        else ""
+    )
+
+    return ROW_TEMPLATE.format(
+        target_id=row.get("target_id", "?"),
+        sample_id=row.get("sample_id", "?"),
+        problems=problems,
+        protac_smiles=value("protac_smiles", "(could not be read)"),
+        linker_smiles=value("linker_smiles", "(could not be read)"),
+        fragments=fragments,
+        mw=value("prop_mw"),
+        sa=value("prop_sa_score"),
+        clogp=value("prop_clogp"),
+        tpsa=value("prop_tpsa"),
+        rotatable=value("prop_rotatable_bonds"),
+        linker_atoms=value("linker_heavy_atoms"),
+        span=value("linker_path_length_bonds", "unknown"),
+        reactive=reactive_line,
+        linker_size=value("linker_size", "its current length"),
+    )
