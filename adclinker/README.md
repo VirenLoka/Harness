@@ -74,6 +74,26 @@ git -C REINVENT4 show \
 90 MB, and it verifies against the `sha512.sum` that was deleted beside it.
 `setup_models.sh` does this automatically.
 
+### REINVENT dies on the way out in a restricted container
+
+`Reinvent.py` calls `report_resource_usage()` **after** the run finishes, and
+that calls `resource.getrusage()`. A sandboxed container — a Jupyter image,
+most notably — refuses it with `PermissionError: Operation not permitted`.
+REINVENT guards the *import* of `resource` against Windows but not the
+*call*, so a complete set of samples ends up on disk behind a non-zero exit
+code.
+
+Two defences, because either alone leaves a gap:
+
+- `reinvent.sandbox_safe` (default on) runs REINVENT through a shim that
+  makes that one call tolerant and then hands straight to its own entry
+  point. The interpreter is found beside the console script, so nothing has
+  to be told which environment REINVENT lives in; if it cannot be found, the
+  plain console script is used instead.
+- `generate` reads the output before trusting the exit code. If REINVENT
+  wrote usable samples and then failed, the run is used and the failure is
+  reported rather than discarded.
+
 ### A bare maleimide cannot be acylated
 
 The maleimide nitrogen is already an imide with two carbonyls; bonding a third

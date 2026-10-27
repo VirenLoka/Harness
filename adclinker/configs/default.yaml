@@ -22,6 +22,9 @@ reinvent:
   prior_file: ../REINVENT4/priors/linkinvent.prior
   model_file: null
   device: cpu
+  # Neutralise REINVENT's post-run memory report, which a sandboxed
+  # container refuses and which otherwise kills a finished run.
+  sandbox_safe: true
   working_dir: runs
   num_smiles: 200
   unique_molecules: true

@@ -49,6 +49,43 @@ STATE_VALID = 1
 STATE_DUPLICATE = 2
 
 
+# REINVENT reports peak memory after a run finishes, and in a restricted
+# container `resource.getrusage` raises PermissionError. It guards the import
+# against Windows but not the call, so a completed sampling run dies on the
+# way out with a non-zero exit and nothing to show for it.
+#
+# This shim neutralises that one call and then hands straight over to
+# REINVENT's own entry point, so nothing else about the run changes. It is
+# used in place of the console script when `reinvent.sandbox_safe` is set and
+# the environment's interpreter can be located.
+RESOURCE_SHIM = """
+import sys, resource as _resource
+
+_original = _resource.getrusage
+
+
+class _Zero:
+    def __getattr__(self, name):
+        return 0
+
+
+def _tolerant(who):
+    try:
+        return _original(who)
+    except Exception:
+        # A sandbox that refuses getrusage should not lose a finished run.
+        return _Zero()
+
+
+_resource.getrusage = _tolerant
+
+from reinvent.Reinvent import main_script
+
+sys.argv = ["reinvent"] + sys.argv[1:]
+sys.exit(main_script())
+"""
+
+
 class ReinventError(RuntimeError):
     """REINVENT could not be run, or did not produce usable output."""
 
@@ -215,6 +252,54 @@ def write_transfer_learning_config(
 # ---------------------------------------------------------------- the running
 
 
+def environment_python(executable: str | None) -> Path | None:
+    """The interpreter beside REINVENT's console script, if there is one.
+
+    Console scripts live in the same `bin` directory as the interpreter of
+    the environment that installed them, so this finds the right Python
+    without having to be told which environment REINVENT is in.
+    """
+    if not executable:
+        return None
+    for name in ("python", "python3"):
+        candidate = Path(executable).resolve().parent / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def build_command(
+    cfg: dict[str, Any],
+    config_path: Path,
+    *,
+    runtime: Runtime | None = None,
+    log_path: Path | None = None,
+) -> list[str]:
+    """The argv for one REINVENT run.
+
+    Uses the resource shim when `sandbox_safe` is set and the environment's
+    interpreter is reachable; falls back to the console script otherwise, so
+    a layout this cannot work out still runs, just without the protection.
+    """
+    settings = cfg["reinvent"]
+    runtime = runtime or probe(cfg)
+
+    command: list[str]
+    interpreter = (
+        environment_python(runtime.executable)
+        if settings.get("sandbox_safe", True)
+        else None
+    )
+    if interpreter is not None:
+        command = [str(interpreter), "-c", RESOURCE_SHIM, str(config_path)]
+    else:
+        command = [str(runtime.executable), str(config_path)]
+
+    if log_path is not None:
+        command += ["--log-filename", str(log_path)]
+    return command
+
+
 def run_config(
     cfg: dict[str, Any], config_path: Path, *, log_path: Path | None = None
 ) -> subprocess.CompletedProcess:
@@ -228,10 +313,9 @@ def run_config(
     if runtime.problems:
         raise ReinventError("; ".join(runtime.problems))
 
-    command = [str(runtime.executable), str(config_path)]
+    command = build_command(cfg, config_path, runtime=runtime, log_path=log_path)
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        command += ["--log-filename", str(log_path)]
 
     env = dict(os.environ)
     # Custom scoring components are found through sys.path, not a dedicated

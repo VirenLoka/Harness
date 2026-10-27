@@ -473,7 +473,9 @@ def test_wrong_columns_are_reported_clearly(tmp_path):
 # ---------------------------------------------------------------- end to end
 
 
-def write_fake_reinvent(tmp_path: Path, rows: list[tuple[str, int, str, str]]) -> Path:
+def write_fake_reinvent(
+    tmp_path: Path, rows: list[tuple[str, int, str, str]], exit_code: int = 0
+) -> Path:
     """A stand-in for the `reinvent` console script.
 
     It reads the TOML it was given, finds the output path, and writes the
@@ -493,6 +495,9 @@ def write_fake_reinvent(tmp_path: Path, rows: list[tuple[str, int, str, str]]) -
         "    fh.write('SMILES,SMILES_state,Warheads,Linker,NLL\\n')\n"
         "    for smiles, state, _w, linker in rows:\n"
         "        fh.write(f'{smiles},{state},{pair},{linker},5.0\\n')\n"
+        # A restricted container makes the real one fail exactly here: after
+        # the output is written, on the final resource report.
+        f"sys.exit({exit_code})\n"
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
     return script
@@ -605,3 +610,117 @@ def test_reactive_chemistry_away_from_the_handle_is_gated(dataset):
     result = score.score_smiles(with_aldehyde, context)
     assert "reactive_group" in result.gates_failed
     assert not result.accepted
+
+
+# -------------------------------------------------- restricted containers
+
+
+def test_the_shim_survives_a_refused_getrusage():
+    """A sandboxed container raises PermissionError from resource.getrusage.
+    REINVENT guards the *import* against Windows but not the *call*, and it
+    makes that call after the run finishes -- so a complete set of samples
+    dies on the way out. Run the shim's logic against a raising stub."""
+    import resource as real_resource
+
+    namespace = {}
+    body = rv.RESOURCE_SHIM.split("from reinvent.Reinvent")[0]
+    original = real_resource.getrusage
+
+    def refuse(_who):
+        raise PermissionError(1, "Operation not permitted")
+
+    real_resource.getrusage = refuse
+    try:
+        exec(body, namespace)
+        patched = real_resource.getrusage
+        assert patched(real_resource.RUSAGE_SELF).ru_maxrss == 0
+    finally:
+        real_resource.getrusage = original
+
+
+def test_the_shim_is_used_when_the_interpreter_is_beside_the_script(cfg, tmp_path):
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    for name in ("reinvent", "python"):
+        path = binaries / name
+        path.write_text("#!/bin/sh\n")
+        path.chmod(path.stat().st_mode | stat.S_IEXEC)
+
+    runtime = rv.Runtime(executable=str(binaries / "reinvent"), prior_present=True)
+    command = rv.build_command(cfg, tmp_path / "c.toml", runtime=runtime)
+    assert Path(command[0]).name == "python"
+    assert command[1] == "-c"
+    assert command[-1].endswith("c.toml")
+
+
+def test_it_falls_back_to_the_console_script(cfg, tmp_path):
+    """A layout this cannot work out must still run, just unprotected."""
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    script = binaries / "reinvent"
+    script.write_text("#!/bin/sh\n")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+
+    runtime = rv.Runtime(executable=str(script), prior_present=True)
+    command = rv.build_command(cfg, tmp_path / "c.toml", runtime=runtime)
+    assert Path(command[0]).name == "reinvent"
+
+
+def test_a_crash_after_writing_output_does_not_lose_the_run(cfg, tmp_path, monkeypatch):
+    """REINVENT reports peak memory after the run completes. If that call
+    raises, a full set of samples is already on disk behind a failed exit
+    code, and throwing it away would waste the whole sampling run."""
+    from adclinker.__main__ import main
+
+    prior = tmp_path / "fake.prior"
+    prior.write_bytes(b"present")
+    script = write_fake_dsh_style(tmp_path, exit_code=1)
+
+    config_file = tmp_path / "adc.yaml"
+    import yaml
+
+    config_file.write_text(
+        yaml.safe_dump(
+            {
+                "reference": {
+                    "dataset": cfg["reference"]["dataset"],
+                    "cache": cfg["reference"]["cache"],
+                },
+                "reinvent": {
+                    "executable": sys.executable,
+                    "prior_file": str(prior),
+                    "working_dir": str(tmp_path),
+                    "sampling_config": str(tmp_path / "s.toml"),
+                    "warheads_file": str(tmp_path / "w.smi"),
+                    "samples_csv": str(tmp_path / "samples.csv"),
+                    "num_smiles": 2,
+                },
+                "report": {"output_dir": str(tmp_path / "report")},
+                "run": {"log_to_file": False},
+            }
+        )
+    )
+
+    def run(c, path, log_path=None):
+        import subprocess
+
+        return subprocess.run(
+            [sys.executable, str(script), str(path)], capture_output=True, text=True
+        )
+
+    monkeypatch.setattr(rv, "run_config", run)
+    assert main(["generate", "--config", str(config_file), "--no-progress"]) == 0
+    assert (tmp_path / "report" / "candidates.csv").is_file()
+
+
+def write_fake_dsh_style(tmp_path: Path, exit_code: int = 0) -> Path:
+    """A REINVENT stand-in that writes its samples and then fails, the way a
+    restricted container makes the real one fail."""
+    return write_fake_reinvent(
+        tmp_path,
+        [
+            ("ignored", 1, "", "[*]CCOCC[*]"),
+            ("ignored", 1, "", "[*]CCOCCOCC[*]"),
+        ],
+        exit_code=exit_code,
+    )

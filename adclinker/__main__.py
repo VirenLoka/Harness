@@ -265,12 +265,35 @@ def _cmd_generate(cfg: dict[str, Any], args: argparse.Namespace) -> int:
 
     log_path = resolve(cfg, cfg["run"]["log_dir"]) / "generate.log"
     result = rv.run_config(cfg, config_path, log_path=log_path)
-    if result.returncode != 0:
-        print(f"REINVENT exited {result.returncode}", file=sys.stderr)
-        print(result.stderr[-3000:], file=sys.stderr)
-        return 1
 
-    samples = rv.read_samples(samples_csv)
+    # A non-zero exit does not always mean the sampling failed. REINVENT
+    # reports peak memory *after* the run finishes, and in a restricted
+    # container that call raises, so a complete set of samples can be sitting
+    # on disk behind a failed exit code. Look before giving up.
+    samples: list[rv.Sample] = []
+    if result.returncode != 0:
+        try:
+            samples = rv.read_samples(samples_csv)
+        except rv.ReinventError:
+            samples = []
+        if not samples:
+            print(f"REINVENT exited {result.returncode}", file=sys.stderr)
+            print(result.stderr[-3000:], file=sys.stderr)
+            return 1
+        LOG.warning(
+            "REINVENT exited %d but wrote %d samples; using them. Last error:\n%s",
+            result.returncode,
+            len(samples),
+            "\n".join(result.stderr.strip().splitlines()[-3:]),
+        )
+        print(
+            f"\n  note: REINVENT exited {result.returncode} after writing its "
+            f"output, so the run is being used anyway.\n"
+            f"  This is usually a sandboxed container refusing the final "
+            f"memory report; see {log_path}."
+        )
+    else:
+        samples = rv.read_samples(samples_csv)
     stats = rv.summarise_samples(samples)
     print(
         f"\n  sampled {stats['total']}: {stats['valid']} valid "

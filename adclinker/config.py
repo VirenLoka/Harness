@@ -42,6 +42,12 @@ DEFAULTS: dict[str, Any] = {
         # from that instead.
         "model_file": None,
         "device": "cpu",
+        # Run REINVENT through a shim that neutralises its post-run
+        # `resource.getrusage` call. A restricted container refuses it and
+        # REINVENT dies on the way out, losing a completed sampling run.
+        # Falls back to the plain console script if the environment's
+        # interpreter cannot be located.
+        "sandbox_safe": True,
         "working_dir": "runs",
         # Per warhead pair, not per run: the sampler multiplies this by the
         # number of lines in the warheads file.
