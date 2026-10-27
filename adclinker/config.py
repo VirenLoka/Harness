@@ -97,6 +97,17 @@ DEFAULTS: dict[str, Any] = {
         "summary_json": "summary.json",
         "top_n": 200,
     },
+    # Where `prompts` writes, and which repair classes are worth a prompt.
+    # `clean` is excluded by default: a candidate that passed every gate and
+    # sits under the cLogP ceiling has nothing stated to repair, and handing
+    # one to an agent invites it to change a molecule that was already fine.
+    "promptout": {
+        "output_dir": "runs/prompts",
+        "system_file": "system_prompt.txt",
+        "tasks_jsonl": "repair_tasks.jsonl",
+        "manifest_csv": "manifest.csv",
+        "classes": ["payload", "release", "handle", "structural", "chemistry", "greasy"],
+    },
     "run": {
         "log_dir": "runs/logs",
         "log_level": "INFO",

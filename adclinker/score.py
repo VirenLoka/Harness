@@ -4,8 +4,26 @@ This is the one object the whole pipeline turns on. It is REINVENT's reward,
 the filter on anything a generator emits, the ranking criterion, and the
 objective the LLM stage optimises against. Written once, used four times.
 
-Every window here comes from `reference.py`, which measures roughly 1,700
-real ADC linker reagents. Nothing is a number I chose.
+Every threshold here comes from `reference.py`, which measures 1,692 real ADC
+linker reagents, and every one is then checked against the drug-linkers of
+the 16 approved ADCs in `tests/data/approved_adcs.json`. Nothing is a number
+chosen by hand, and nothing survives that rejects a marketed drug.
+
+**What is measured, and what is gated, are different molecules.** A gate asks
+whether this conjugate is a candidate at all -- payload intact, one handle,
+a trigger, nothing reactive loose -- and those are properties of the whole
+assembled thing. A scored term asks how good the *linker* is, and the
+reference set is payload-free reagents, so the payload is excised before
+anything is measured. Mixing the two was the defect this module was rewritten
+to fix; `linker_portion` records what it cost.
+
+**Two thresholds are one-sided, not windows, and that is evidence not taste.**
+Hydrophobicity and polar surface are monotone for an ADC linker: the linker
+is discarded on release and never crosses a membrane, so there is no point at
+which being more polar starts to hurt. Enhertu's linker measures cLogP -1.71
+and Trodelvy's has TPSA 340, both outside the reference band on the good
+side, and both are approved. A two-sided window marked them down for the
+property that makes them work.
 
 **Why this is not `protacbench.score` with different constants.** It reads
 the same descriptors and inverts most of them. A PROTAC linker is a geometric
@@ -18,10 +36,18 @@ thresholds would reject every real ADC linker. The helpers are duplicated
 rather than shared for the same reason: tuning one must not silently move the
 other.
 
-**Gates versus scores.** Three properties are not tradeable. A linker-payload
-that lost its payload, lost its cleavage trigger, or carries two reactive
-handles is not a worse candidate -- it is not a candidate, and averaging it
-into a weighted score would let a high cLogP term hide it. Those reject.
+**Gates versus scores.** Some properties are not tradeable. A linker-payload
+that lost its payload, lost its cleavage trigger, has nothing that frees the
+drug once the trigger is cut, or carries two conjugation handles is not a
+worse candidate -- it is not a candidate, and averaging it into a weighted
+score would let a good cLogP term hide it. Those reject.
+
+The gates match the ones `molbench`'s `check_adc_linker` enforces, and the
+chemistry behind both lives in `chemistry.py` with a test holding the two
+copies identical. They have to agree: this module decides what becomes a
+repair task and that tool decides whether a repair is accepted, so an agent
+caught between two versions is chasing a target that moves between the task
+and the grade.
 
 **Why likeness is a floor and not a target.** Nearest-neighbour similarity to
 the reference set answers "would a linker chemist recognise this". Maximising
@@ -35,7 +61,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .reference import Profile, cleavable_motifs, nearest_similarity
+from . import chemistry
+from .reference import Profile, nearest_similarity
 
 # Reasons a candidate is rejected outright rather than ranked low.
 # Reactive or unstable groups that have no business in an ADC spacer.
@@ -68,7 +95,24 @@ GATES: dict[str, str] = {
     "reactive_group": "a reactive or unstable group outside the conjugation handle",
     "disconnected": "the molecule is in more than one piece",
     "payload_lost": "the payload is no longer intact; this is a different drug",
+    "payload_altered": (
+        "the payload is present but its stereochemistry has been changed, "
+        "which makes it a different drug with different potency"
+    ),
+    "payload_internal": (
+        "the payload is in the middle of the molecule rather than at the end, "
+        "so cleaving the linker cannot release it"
+    ),
     "trigger_lost": "the cleavable motif is gone, so the payload can never be released",
+    "no_release_chemistry": (
+        "there is a cleavage trigger but nothing between it and the payload "
+        "that frees the drug, so cutting the trigger leaves the payload still "
+        "carrying part of the cassette"
+    ),
+    "bad_junction": (
+        "the linker contains a junction nobody would make, usually from "
+        "joining an acyl handle to a spacer that starts with a carbon"
+    ),
     "handle_lost": "no reactive handle, so it cannot be conjugated",
     "handle_duplicated": "more than one reactive handle, which would crosslink",
     "too_small": "smaller than any linker in the reference set",
@@ -137,6 +181,12 @@ class ADCScore:
     gate_detail: str = ""
     terms: list[Term] = field(default_factory=list)
     properties: dict[str, Any] = field(default_factory=dict)
+    # The same descriptors for the linker alone, which is what the reference
+    # windows are measured on and what every scored term is judged against.
+    linker_properties: dict[str, Any] = field(default_factory=dict)
+    linker_smiles: str | None = None
+    payload_atoms: list[int] = field(default_factory=list)
+    scored_on: str = "conjugate"  # or "linker"
     similarity: float | None = None
     triggers: list[str] = field(default_factory=list)
     reason: str = ""
@@ -154,8 +204,11 @@ class ADCScore:
             "score_reason": self.reason,
             "nearest_similarity": self.similarity,
             "cleavable_triggers": ";".join(self.triggers),
+            "scored_on": self.scored_on,
+            "linker_smiles": self.linker_smiles,
         }
         row.update({f"prop_{k}": v for k, v in self.properties.items()})
+        row.update({f"linker_{k}": v for k, v in self.linker_properties.items()})
         for term in self.terms:
             row[f"score_{term.name}"] = round(term.score, 4)
         return row
@@ -179,7 +232,14 @@ class Context:
 
 
 def _payload_query(payload_smiles: str) -> Any:
-    """The payload as a substructure query, dummies stripped."""
+    """The payload as a substructure query, dummies stripped.
+
+    The same three corrections the PROTAC checker needs, for the same
+    reasons: a dummy atom matches nothing, removing one from an unsanitised
+    mol leaves a radical that will not match a filled valence, and an
+    explicit `[H]` survives as a heavy query atom that matches nothing.
+    Without them a perfectly correct conjugate reports its payload missing.
+    """
     from rdkit import Chem
 
     mol = Chem.MolFromSmiles(payload_smiles, sanitize=False)
@@ -187,9 +247,17 @@ def _payload_query(payload_smiles: str) -> Any:
         return None
     editable = Chem.RWMol(mol)
     for index in sorted(
-        (a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 0), reverse=True
+        (
+            a.GetIdx()
+            for a in mol.GetAtoms()
+            if a.GetAtomicNum() == 0 or a.GetAtomicNum() == 1
+        ),
+        reverse=True,
     ):
         editable.RemoveAtom(index)
+    for atom in editable.GetAtoms():
+        atom.SetNumRadicalElectrons(0)
+        atom.SetNoImplicit(False)
     query = editable.GetMol()
     try:
         Chem.SanitizeMol(query)
@@ -198,14 +266,92 @@ def _payload_query(payload_smiles: str) -> Any:
     return query
 
 
+_QUERY_CACHE: dict[str, Any] = {}
+
+
+def _cached_query(smarts: str) -> Any:
+    """Compile once. These run per molecule across thousands of candidates."""
+    from rdkit import Chem
+
+    query = _QUERY_CACHE.get(smarts)
+    if query is None:
+        query = Chem.MolFromSmarts(smarts)
+        if query is None:  # our pattern, our bug
+            raise ValueError(f"invalid SMARTS in chemistry.py: {smarts!r}")
+        _QUERY_CACHE[smarts] = query
+    return query
+
+
+def _piece_count(mol: Any, indices: list[int]) -> int:
+    """How many connected pieces `indices` falls into within `mol`."""
+    remaining = set(indices)
+    pieces = 0
+    while remaining:
+        stack = [remaining.pop()]
+        pieces += 1
+        while stack:
+            current = stack.pop()
+            for neighbour in mol.GetAtomWithIdx(current).GetNeighbors():
+                index = neighbour.GetIdx()
+                if index in remaining:
+                    remaining.discard(index)
+                    stack.append(index)
+    return pieces
+
+
+def linker_portion(mol: Any, payload_atoms: list[int]) -> Any | None:
+    """The conjugate with its payload excised: handle + spacer + cassette.
+
+    **This is the only thing comparable to the reference set, and scoring
+    the conjugate instead was a measurement error, not a design choice.**
+    `reference.py` profiles linker *reagents* -- Mc-Val-Cit-PABC-PNP and its
+    kin -- which carry no payload at all. An MMAE conjugate is MW 1460 with
+    cLogP 5.5; the reference cLogP window is -0.8 to 3.1. Every candidate
+    therefore landed outside every window regardless of its spacer, which
+    pinned the polarity, polar-surface, size and synthesisability terms --
+    60% of the total weight -- at the same value for everything.
+
+    What that cost, measured: brentuximab vedotin's own drug-linker scored
+    43/100, a C12 greasy spacer scored 42.9, and PEG8 scored 37.4. The
+    scorer preferred a greasy chain to PEG, which inverts the one property
+    its own docstring calls the failure mode that kills ADCs in vivo.
+
+    Excising the payload restores the discrimination: on the same three
+    spacers the real PEG2 lands inside all three windows and the C12 chain
+    is correctly flagged out on cLogP.
+
+    Returns None when the payload cannot be excised cleanly, and the caller
+    falls back to the whole molecule rather than guessing.
+    """
+    from rdkit import Chem
+
+    if not payload_atoms:
+        return None
+    keep = [i for i in range(mol.GetNumAtoms()) if i not in set(payload_atoms)]
+    if not keep:
+        return None
+    smiles = Chem.MolFragmentToSmiles(mol, atomsToUse=keep, canonical=True)
+    return Chem.MolFromSmiles(smiles)
+
+
 _REACTIVE_QUERIES: list[tuple[str, Any]] = []
 
 
 def reactive_groups_outside(mol: Any, exempt: set[int]) -> list[str]:
     """Disqualifying groups whose atoms lie outside `exempt`.
 
-    `exempt` is the conjugation handle. A match that overlaps it at all is
-    skipped, because the handle's reactivity is the design, not a defect.
+    `exempt` must hold BOTH the conjugation handle and the payload, and both
+    for the same reason: their chemistry is given, not designed. The handle
+    is deliberately reactive -- a maleimide is a Michael acceptor, which is
+    the point -- and a payload is whatever the medicinal chemistry programme
+    made it.
+
+    Exempting only the handle rejected four approved ADCs. DM1 carries an
+    epoxide in its maytansinoid ring, so Kadcyla and Elahere were rejected
+    for `epoxide`; calicheamicin's enediyne matches the Michael-acceptor
+    pattern, so Mylotarg and Besponsa were rejected for `michael_acceptor`.
+    In every case the group was a feature of the approved drug, blamed on
+    the linker.
     """
     global _REACTIVE_QUERIES
     from rdkit import Chem
@@ -246,23 +392,108 @@ def check_gates(mol: Any, context: Context, score: ADCScore) -> None:
     # The payload must survive unchanged. A generator or an LLM that
     # "improves" the molecule by editing the drug has produced something that
     # scores well and is not the compound you wanted.
+    #
+    # Stereochemistry is checked separately and reported separately. MMAE has
+    # ten stereocentres and its potency depends on every one of them, so an
+    # epimer is a different drug -- but it is a drug that is *present*, and
+    # calling it "lost" sends a repair agent to rebuild something already
+    # there. Matching without `useChirality` silently accepts the epimer,
+    # which is the worse of the two errors and the one this had.
     if context.payload_smiles:
         query = _payload_query(context.payload_smiles)
         if query is not None and query.GetNumAtoms():
-            if not mol.HasSubstructMatch(query):
+            flat_match = mol.GetSubstructMatch(query)
+            if not flat_match:
                 score.gates_failed.append("payload_lost")
                 score.gate_detail = (
                     "the payload substructure is not present intact"
                 )
+            else:
+                score.payload_atoms = list(flat_match)
+                if not mol.GetSubstructMatch(query, useChirality=True):
+                    score.gates_failed.append("payload_altered")
+                    score.gate_detail = score.gate_detail or (
+                        "the payload is present but at least one stereocentre "
+                        "has been inverted"
+                    )
+                # A payload in the middle of the chain cannot be released by
+                # cutting the linker, however good the cassette is. Excising
+                # it leaves two pieces, which is how that is visible at all.
+                remainder = [
+                    i for i in range(mol.GetNumAtoms()) if i not in set(flat_match)
+                ]
+                if remainder and _piece_count(mol, remainder) > 1:
+                    score.gates_failed.append("payload_internal")
+                    score.gate_detail = score.gate_detail or (
+                        "the payload sits between two parts of the linker "
+                        "rather than at its end"
+                    )
 
     # The release trigger. Without it a cleavable design never releases, and
     # no descriptor would reveal that.
-    score.triggers = cleavable_motifs(mol)
+    #
+    # Matched against the shared table in `chemistry.py` rather than this
+    # module's own list, so the scorer and the molbench tool that grades a
+    # repair agree on what a trigger is. A trigger wholly inside the payload
+    # does not count -- DM1 carries a carbamate in its ansa ring, and a bond
+    # within the drug does not release the drug.
+    payload_set = set(score.payload_atoms)
+    score.triggers = [
+        name
+        for name, smarts in chemistry.ADC_TRIGGERS
+        if any(
+            not payload_set.issuperset(match)
+            for match in mol.GetSubstructMatches(_cached_query(smarts))
+        )
+    ]
     if context.require_cleavable and not score.triggers:
         score.gates_failed.append("trigger_lost")
         score.gate_detail = (
             score.gate_detail or "no lysosomal cleavage motif is present"
         )
+    elif context.require_cleavable and score.payload_atoms:
+        # A trigger is not release. A cassette bonded straight to the payload
+        # by an amide is cut and leaves the payload still wearing an amino
+        # acid; it looks perfect in every descriptor and does nothing.
+        junction = {
+            atom
+            for bond in mol.GetBonds()
+            for atom in (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+            if (bond.GetBeginAtomIdx() in payload_set)
+            != (bond.GetEndAtomIdx() in payload_set)
+        }
+        frees = False
+        for _name, smarts, releases, _note in chemistry.RELEASE_CHEMISTRIES:
+            if not releases:
+                continue
+            for match in mol.GetSubstructMatches(_cached_query(smarts)):
+                found = set(match)
+                if found & payload_set and found - payload_set and found & junction:
+                    frees = True
+                    break
+            if frees:
+                break
+
+        # A peptide trigger that reaches the junction releases the payload by
+        # being cut itself -- there is no spacer because none is needed. That
+        # is how Decnupaz's Ala-Ala works, and rejecting it would reject an
+        # approved drug. The cleavage is slow when the payload is bulky,
+        # which is the reason the p-aminobenzyl spacer exists, but slow is
+        # not the same as impossible and this is not the place to gate on it.
+        if not frees:
+            for name, smarts in chemistry.ADC_TRIGGERS:
+                if any(
+                    set(match) & junction
+                    for match in mol.GetSubstructMatches(_cached_query(smarts))
+                ):
+                    frees = True
+                    break
+
+        if not frees:
+            score.gates_failed.append("no_release_chemistry")
+            score.gate_detail = score.gate_detail or (
+                "nothing between the trigger and the payload frees the drug"
+            )
 
     # Exactly one reactive handle: none cannot be conjugated, two crosslinks.
     handle_atoms: set[int] = set()
@@ -284,7 +515,23 @@ def check_gates(mol: Any, context: Context, score: ADCScore) -> None:
     # atoms are excluded, which is what lets a maleimide -- a Michael acceptor
     # by construction, and the single most common ADC conjugation chemistry --
     # pass while a stray aldehyde in the spacer does not.
-    stray = reactive_groups_outside(mol, handle_atoms)
+    # Junctions the generated spacer created, checked on the linker only --
+    # a payload is entitled to its own ketones. The same table the molbench
+    # tool uses, so a candidate the scorer passes is not one the tool then
+    # rejects.
+    linker_only = {i for i in range(mol.GetNumAtoms()) if i not in payload_set}
+    junctions: list[str] = []
+    for name, smarts, _why in chemistry.BAD_JUNCTIONS:
+        for match in mol.GetSubstructMatches(_cached_query(smarts)):
+            if linker_only.issuperset(match) and not handle_atoms.intersection(match):
+                junctions.append(name)
+                break
+    if junctions:
+        score.gates_failed.append("bad_junction")
+        score.gate_detail = score.gate_detail or ", ".join(junctions)
+        score.properties["bad_junctions"] = ";".join(junctions)
+
+    stray = reactive_groups_outside(mol, handle_atoms | payload_set)
     if stray:
         score.gates_failed.append("reactive_group")
         score.gate_detail = score.gate_detail or (
@@ -293,9 +540,33 @@ def check_gates(mol: Any, context: Context, score: ADCScore) -> None:
         score.properties["reactive_groups"] = ";".join(stray)
 
 
-def score_molecule(mol: Any, context: Context) -> ADCScore:
-    """Gate, then score, one assembled linker-payload."""
+def _descriptors(mol: Any) -> dict[str, Any]:
     from rdkit.Chem import Crippen, Descriptors, rdMolDescriptors
+
+    return {
+        "heavy_atoms": mol.GetNumHeavyAtoms(),
+        "mw": round(Descriptors.MolWt(mol), 2),
+        "clogp": round(Crippen.MolLogP(mol), 3),
+        "tpsa": round(rdMolDescriptors.CalcTPSA(mol), 2),
+        "rotatable_bonds": rdMolDescriptors.CalcNumRotatableBonds(mol),
+        "fsp3": round(rdMolDescriptors.CalcFractionCSP3(mol), 3),
+        "hbd": rdMolDescriptors.CalcNumHBD(mol),
+        "hba": rdMolDescriptors.CalcNumHBA(mol),
+    }
+
+
+def score_molecule(mol: Any, context: Context) -> ADCScore:
+    """Gate the whole conjugate, then score the linker inside it.
+
+    The two halves judge different molecules on purpose. A gate asks whether
+    this conjugate is a candidate at all -- payload intact, handle present
+    once, trigger present, nothing reactive loose -- and those are properties
+    of the assembled thing. A scored term asks how good the *linker* is, and
+    the windows it is judged against were measured on payload-free reagents,
+    so it has to be the payload-free portion that is measured. See
+    `linker_portion` for what mixing the two cost.
+    """
+    from rdkit import Chem
 
     score = ADCScore(total=None)
     if mol is None:
@@ -306,16 +577,7 @@ def score_molecule(mol: Any, context: Context) -> ADCScore:
 
     check_gates(mol, context, score)
 
-    properties = {
-        "heavy_atoms": mol.GetNumHeavyAtoms(),
-        "mw": round(Descriptors.MolWt(mol), 2),
-        "clogp": round(Crippen.MolLogP(mol), 3),
-        "tpsa": round(rdMolDescriptors.CalcTPSA(mol), 2),
-        "rotatable_bonds": rdMolDescriptors.CalcNumRotatableBonds(mol),
-        "fsp3": round(rdMolDescriptors.CalcFractionCSP3(mol), 3),
-        "hbd": rdMolDescriptors.CalcNumHBD(mol),
-        "hba": rdMolDescriptors.CalcNumHBA(mol),
-    }
+    properties = _descriptors(mol)
     score.properties = properties
 
     if score.gates_failed:
@@ -324,31 +586,72 @@ def score_molecule(mol: Any, context: Context) -> ADCScore:
         )
         return score
 
+    # The payload is a constant across every candidate for one design, so
+    # leaving it in adds the same offset to every bulk descriptor while
+    # destroying the calibration. Take it out.
+    judged = mol
+    linker_mol = linker_portion(mol, score.payload_atoms)
+    if linker_mol is not None and linker_mol.GetNumHeavyAtoms():
+        judged = linker_mol
+        score.scored_on = "linker"
+        score.linker_properties = _descriptors(linker_mol)
+        score.linker_smiles = Chem.MolToSmiles(linker_mol)
+    elif context.payload_smiles:
+        # Say so rather than silently reverting to the broken comparison.
+        score.scored_on = "conjugate (payload could not be excised)"
+
     profile = context.profile
     terms: list[Term] = []
+    # Everything from here down is measured on `judged` -- the linker alone
+    # wherever the payload could be excised -- because that is the molecule
+    # the reference windows describe.
+    measured = score.linker_properties or properties
+    where = "linker" if score.scored_on == "linker" else "conjugate"
 
-    low, high = profile.window("clogp")
+    # One-sided, not a window, for the same reason the gate is a ceiling:
+    # hydrophobicity is monotone. Full credit at or below the reference
+    # median, falling to zero at the ceiling.
+    #
+    # A two-sided window penalised exactly the wrong molecules. Enhertu's
+    # linker measures cLogP -1.71, below the reference band, and scored 66.7
+    # against 82.4 for Adcetris -- it was marked down for being more polar
+    # than a typical reagent, which is the property that lets it carry eight
+    # payloads per antibody instead of four.
+    ceiling = chemistry.LINKER_CLOGP_CEILING
+    median_clogp = profile.properties["clogp"].median
     terms.append(
         Term(
             "polarity",
-            _window(properties["clogp"], low, high),
+            1.0
+            if measured["clogp"] <= median_clogp
+            else _ramp(measured["clogp"], good=median_clogp, bad=ceiling),
             WEIGHTS["polarity"][0],
-            f"cLogP {properties['clogp']} against reference {low:.1f} to {high:.1f}",
+            f"{where} cLogP {measured['clogp']} against a ceiling of "
+            f"{ceiling} (reference median {median_clogp:.2f})",
         )
     )
 
+    # Fsp3 is scored softly here and is deliberately NOT in
+    # `chemistry.JUDGED_PROPERTIES`, which governs what the molbench tool
+    # treats as a pass/fail. The distinction is the point: the reagent band
+    # [0.50-1.00] is outside for 10 of the 16 approved ADCs, because the
+    # reference set is bare PEG and alkyl while a finished linker carries an
+    # aromatic spacer and a dipeptide. As a hard check that would reject the
+    # standard of care. As a ranking signal with the window's own taper it
+    # costs those 16 an average of 1.2 points out of 100, which is a nudge
+    # away from fully aromatic linkers rather than a verdict.
     low, high = profile.window("fsp3")
     terms.append(
         Term(
             "saturation",
-            _window(properties["fsp3"], low, high),
+            _window(measured["fsp3"], low, high),
             WEIGHTS["saturation"][0],
-            f"Fsp3 {properties['fsp3']} (reference median "
+            f"{where} Fsp3 {measured['fsp3']} (reference median "
             f"{profile.properties['fsp3'].median:.2f})",
         )
     )
 
-    similarity = nearest_similarity(mol, context.reference_fingerprints)
+    similarity = nearest_similarity(judged, context.reference_fingerprints)
     score.similarity = round(similarity, 4)
     # A floor, not a target: full credit once it is recognisably a linker.
     terms.append(
@@ -369,13 +672,22 @@ def score_molecule(mol: Any, context: Context) -> ADCScore:
         )
     )
 
-    low, high = profile.window("tpsa")
+    # A floor, not a window, and for the same reason. Polar surface helps an
+    # ADC linker and there is no amount that starts to hurt: Trodelvy's
+    # linker has TPSA 340, well above the reference band, and is approved.
+    low, _median, _high = (
+        profile.window("tpsa")[0],
+        profile.properties["tpsa"].median,
+        profile.window("tpsa")[1],
+    )
     terms.append(
         Term(
             "polar_surface",
-            _window(properties["tpsa"], low, high),
+            1.0 if measured["tpsa"] >= _median else _ramp(
+                measured["tpsa"], good=_median, bad=low * 0.5
+            ),
             WEIGHTS["polar_surface"][0],
-            f"TPSA {properties['tpsa']}",
+            f"{where} TPSA {measured['tpsa']} (reference median {_median:.0f})",
         )
     )
 
@@ -383,13 +695,13 @@ def score_molecule(mol: Any, context: Context) -> ADCScore:
     terms.append(
         Term(
             "size",
-            _window(float(properties["heavy_atoms"]), low, high),
+            _window(float(measured["heavy_atoms"]), low, high),
             WEIGHTS["size"][0],
-            f"{properties['heavy_atoms']} heavy atoms",
+            f"{measured['heavy_atoms']} {where} heavy atoms",
         )
     )
 
-    sa = _sa_score(mol)
+    sa = _sa_score(judged)
     terms.append(
         Term(
             "synthesisability",

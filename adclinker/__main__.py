@@ -32,7 +32,7 @@ from typing import Any
 from moltrain import logs
 
 from . import reinvent as rv
-from . import reference, score, slice as slicing, warheads as wh
+from . import prompts, reference, score, slice as slicing, warheads as wh
 from .config import ConfigError, load_config, resolve
 
 LOG = logs.get_logger("adclinker")
@@ -456,6 +456,106 @@ def _write_report(cfg: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, 
     return {"candidates_csv": csv_path, "summary_json": summary_path}
 
 
+def _cmd_prompts(cfg: dict[str, Any], args: argparse.Namespace) -> int:
+    """Write paste-ready repair prompts, one per candidate worth repairing."""
+    settings = cfg["promptout"]
+    source = (
+        Path(args.source)
+        if args.source
+        else resolve(cfg, cfg["report"]["output_dir"]) / cfg["report"]["candidates_csv"]
+    )
+    if not source.is_file():
+        print(
+            f"no candidates at {source}. Run `python -m adclinker generate` "
+            "first, or pass --source.",
+            file=sys.stderr,
+        )
+        return 1
+
+    wanted = set(settings["classes"])
+    out_dir = resolve(cfg, settings["output_dir"])
+    task_dir = out_dir / "tasks"
+
+    # Clear first. A prompt left over from an earlier run is
+    # indistinguishable from a current one once it is sitting in a folder you
+    # are working through, so you would send exactly the molecules this run
+    # decided to skip.
+    if task_dir.is_dir():
+        removed = 0
+        for stale in task_dir.glob("*.txt"):
+            stale.unlink()
+            removed += 1
+        if removed:
+            LOG.info("cleared %d prompt(s) from a previous run", removed)
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    system_path = out_dir / settings["system_file"]
+    system_path.write_text(prompts.SYSTEM_PROMPT)
+
+    payload_name = cfg["design"]["payload"]
+    payload_smiles = wh.strip_atom_maps(wh.PAYLOADS[payload_name].smiles)
+    handle_note = wh.HANDLES[cfg["design"]["handle"]].site
+
+    counts: dict[str, int] = {}
+    written = 0
+    tasks_path = out_dir / settings["tasks_jsonl"]
+    manifest: list[dict[str, Any]] = []
+
+    with source.open(encoding="utf-8", errors="replace", newline="") as handle, \
+            tasks_path.open("w") as tasks_out:
+        for row in csv.DictReader(handle):
+            group = prompts.classify_row(row)
+            counts[group] = counts.get(group, 0) + 1
+            if group not in wanted:
+                continue
+            if args.limit and written >= args.limit:
+                continue
+
+            task = prompts.build_task(row, payload_smiles, handle_note)
+            name = f"{group}-{written:04d}.txt"
+            (task_dir / name).write_text(task["prompt"])
+            tasks_out.write(json.dumps(task) + "\n")
+            manifest.append(
+                {
+                    "task_id": task["task_id"],
+                    "repair_class": group,
+                    "gates_failed": row.get("gates_failed", ""),
+                    "linker_clogp": row.get("linker_clogp", ""),
+                    "prompt_file": str(task_dir / name),
+                }
+            )
+            written += 1
+
+    manifest_path = out_dir / settings["manifest_csv"]
+    if manifest:
+        with manifest_path.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(manifest[0]))
+            writer.writeheader()
+            writer.writerows(manifest)
+
+    print(f"read {sum(counts.values())} candidates from {source}\n")
+    print("  by repair class:")
+    for group in sorted(counts, key=lambda g: -counts[g]):
+        mark = "  -> prompts written" if group in wanted else "     skipped"
+        print(f"    {counts[group]:>6}  {group:<12}{mark}")
+    print(f"\n  wrote {written} prompt(s)")
+    print(
+        f"\n  withheld from every prompt: "
+        f"{', '.join(sorted(prompts.WITHHELD_COLUMNS))}\n"
+        "  the score columns go because a composite is gameable in a way raw\n"
+        "  descriptors are not; reinvent_smiles goes because it carries the\n"
+        "  payload with its stereochemistry stripped, and an agent that\n"
+        "  copies it back in fails the one gate that matters."
+    )
+    print()
+    print(f"{'system prompt':>16}: {system_path}")
+    print(f"{'one per task':>16}: {task_dir}/")
+    print(f"{'structured':>16}: {tasks_path}")
+    if manifest:
+        print(f"{'manifest':>16}: {manifest_path}")
+    return 0
+
+
 COMMANDS = {
     "probe": _cmd_probe,
     "profile": _cmd_profile,
@@ -463,6 +563,7 @@ COMMANDS = {
     "prepare": _cmd_prepare,
     "finetune": _cmd_finetune,
     "generate": _cmd_generate,
+    "prompts": _cmd_prompts,
 }
 
 
@@ -479,6 +580,9 @@ def main(argv: list[str] | None = None) -> int:
         "--dry-run", action="store_true", help="write the config but run nothing"
     )
     parser.add_argument("--json", action="store_true", help="also dump JSON")
+    parser.add_argument(
+        "--source", default=None, help="candidates.csv to build prompts from"
+    )
     logs.add_cli_flags(parser)
     args = parser.parse_args(argv)
 

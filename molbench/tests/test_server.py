@@ -36,6 +36,8 @@ def test_lists_every_tool():
 
     assert sorted(asyncio.run(run())) == [
         "apply_smarts_reaction",
+        "check_adc_linker",
+        "check_payload_release",
         "check_protac_linker",
         "generate_3d_conformer",
         "get_molecule_metrics",

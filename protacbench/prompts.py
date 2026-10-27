@@ -412,10 +412,16 @@ AS MEASURED
   linker: {linker_atoms} heavy atoms spanning {span} bonds between the fragments
 {reactive}
 WHAT TO AIM FOR
-  linker span 8-13 bonds (currently {span})
-  SA at or below 4.9 (currently {sa})
-  cLogP between 3.5 and 5.6 (currently {clogp})
+  linker span 8-17 bonds, never fewer than 7 (currently {span})
+  SA at or below 6.0 (currently {sa})
+  cLogP at or below 7.5 (currently {clogp})
+  TPSA at or above 120 (currently {tpsa})
+  rotatable bonds at or below 30 (currently {rotatable})
   no reactive or unstable groups in the linker
+
+These are the same four limits as the standing instruction, not a stricter
+set: 80% of published PROTACs satisfy all of them at once. Fix the stated
+problem without pushing any of them further out than it already is.
 
 The linker must keep roughly its current length: {linker_size} heavy atoms.
 That length comes from the geometry of the ternary complex, not from

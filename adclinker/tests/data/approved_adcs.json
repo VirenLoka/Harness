@@ -1,0 +1,162 @@
+[
+ {
+  "brand": "Kadcyla",
+  "inn": "trastuzumab emtansine",
+  "cleavable": false,
+  "handle": "carboxylic_acid",
+  "drug_linker_smiles": "COc1cc2cc(c1Cl)N(C)C(=O)C[C@H](OC(=O)[C@H](C)N(C)C(=O)CCSC1CC(=O)N(CC3CCC(C(=O)O)CC3)C1=O)[C@]1(C)O[C@H]1[C@H](C)[C@@H]1C[C@@](O)(NC(=O)O1)[C@H](OC)/C=C/C=C(\\C)C2",
+  "linker_only_smiles": "*C1CC(=O)N(CC2CCC(C(=O)O)CC2)C1=O",
+  "payload_smiles": "COc1cc2cc(c1Cl)N(C)C(=O)C[C@H](OC(=O)[C@H](C)N(C)C(=O)CCS)[C@]1(C)O[C@H]1[C@H](C)[C@@H]1C[C@@](O)(NC(=O)O1)[C@H](OC)/C=C/C=C(\\C)C2",
+  "provenance": "Anchored on PubChem CID 92131096 = DM1-SMCC, CAS 1228105-51-8, C51H66ClN5O16S, MW 1072.6, InChIKey IADUWZMNTKHTIN-MLSWMBHTSA-N -- this is the actual reagent used to make Kadcyla, so it is the right thing to start from. INDEPENDENT CROSS-CHECK: Cayman Chemical product 23926 (DM1-SMCC) gives the same CAS, same formula, same MW and the same InChIKey, and its SMILES, which is written in a completely d"
+ },
+ {
+  "brand": "Elahere",
+  "inn": "mirvetuximab soravtansine (mirvetuximab soravtansine-gynx)",
+  "cleavable": true,
+  "handle": "carboxylic_acid",
+  "drug_linker_smiles": "COc1cc2cc(c1Cl)N(C)C(=O)C[C@H](OC(=O)[C@H](C)N(C)C(=O)CCC(C)(C)SSCCC(C(=O)O)S(=O)(=O)O)[C@]1(C)O[C@H]1[C@H](C)[C@@H]1C[C@@](O)(NC(=O)O1)[C@H](OC)/C=C/C=C(\\C)C2",
+  "linker_only_smiles": "*SCCC(C(=O)O)S(=O)(=O)O",
+  "payload_smiles": "COc1cc2cc(c1Cl)N(C)C(=O)C[C@H](OC(=O)[C@H](C)N(C)C(=O)CCC(C)(C)S)[C@]1(C)O[C@H]1[C@H](C)[C@@H]1C[C@@](O)(NC(=O)O1)[C@H](OC)/C=C/C=C(\\C)C2",
+  "provenance": "Anchored on PubChem CID 91667591, name 'soravtansine', C42H60ClN3O15S3, MW 978.6, InChIKey GQSPYHXXAXFCRB-DSIKUUPMSA-N. INDEPENDENT CROSS-CHECK: ChEMBL CHEMBL3545310, pref_name SORAVTANSINE, carries the same InChIKey and its stored canonical SMILES is byte-for-byte identical to RDKit's canonicalisation of the PubChem string -- two databases, zero divergence, including every stereocentre and both d"
+ },
+ {
+  "brand": "Adcetris",
+  "inn": "brentuximab vedotin",
+  "cleavable": true,
+  "handle": "maleimide",
+  "drug_linker_smiles": "CC[C@H](C)[C@@H]([C@@H](CC(=O)N1CCC[C@H]1[C@H](OC)[C@@H](C)C(=O)N[C@H](C)[C@@H](O)c1ccccc1)OC)N(C)C(=O)[C@@H](NC(=O)[C@H](C(C)C)N(C)C(=O)OCc1ccc(NC(=O)[C@H](CCCNC(N)=O)NC(=O)[C@@H](NC(=O)CCCCCN2C(=O)C=CC2=O)C(C)C)cc1)C(C)C",
+  "linker_only_smiles": "*C(=O)OCc1ccc(NC(=O)[C@H](CCCNC(N)=O)NC(=O)[C@@H](NC(=O)CCCCCN2C(=O)C=CC2=O)C(C)C)cc1",
+  "payload_smiles": "CC[C@H](C)[C@@H]([C@@H](CC(=O)N1CCC[C@H]1[C@H](OC)[C@@H](C)C(=O)N[C@H](C)[C@@H](O)c1ccccc1)OC)N(C)C(=O)[C@@H](NC(=O)[C@@H](NC)C(C)C)C(C)C",
+  "provenance": "Structure taken verbatim from PubChem CID 46944733 (names: MC-vc-PAB-MMAE, MC-Val-Cit-PAB-MMAE, VcMMAE, SGD-1006, 'VEDOTIN PARENT', UNII 026S2O80A8, CAS 646502-53-6), formula C68H105N11O15, MW 1316.6, InChIKey NLMBVBUNULOTNS-HOKPPMCLSA-N. Cross-check 1: MedChemExpress CAS 646502-53-6 independently lists InChIKey NLMBVBUNULOTNS-HOKPPMCLSA-N and MW 1316.63 \u2014 full stereochemistry agrees atom for atom"
+ },
+ {
+  "brand": "Polivy",
+  "inn": "polatuzumab vedotin (polatuzumab vedotin-piiq)",
+  "cleavable": true,
+  "handle": "maleimide",
+  "drug_linker_smiles": "CC[C@H](C)[C@@H]([C@@H](CC(=O)N1CCC[C@H]1[C@H](OC)[C@@H](C)C(=O)N[C@H](C)[C@@H](O)c1ccccc1)OC)N(C)C(=O)[C@@H](NC(=O)[C@H](C(C)C)N(C)C(=O)OCc1ccc(NC(=O)[C@H](CCCNC(N)=O)NC(=O)[C@@H](NC(=O)CCCCCN2C(=O)C=CC2=O)C(C)C)cc1)C(C)C",
+  "linker_only_smiles": "*C(=O)OCc1ccc(NC(=O)[C@H](CCCNC(N)=O)NC(=O)[C@@H](NC(=O)CCCCCN2C(=O)C=CC2=O)C(C)C)cc1",
+  "payload_smiles": "CC[C@H](C)[C@@H]([C@@H](CC(=O)N1CCC[C@H]1[C@H](OC)[C@@H](C)C(=O)N[C@H](C)[C@@H](O)c1ccccc1)OC)N(C)C(=O)[C@@H](NC(=O)[C@@H](NC)C(C)C)C(C)C",
+  "provenance": "Same drug-linker molecule as brentuximab vedotin; only the antibody differs (anti-CD79b). Identity established two ways. (a) Definitional: the WHO INN stem '-vedotin' denotes MMAE attached through the maleimidocaproyl-valyl-citrullinyl-p-aminobenzyloxycarbonyl (mc-val-cit-PABC) radical, and PubChem CID 46944733 carries the synonym 'VEDOTIN PARENT' plus UNII 026S2O80A8 for exactly that radical+payl"
+ },
+ {
+  "brand": "Padcev",
+  "inn": "enfortumab vedotin (enfortumab vedotin-ejfv)",
+  "cleavable": true,
+  "handle": "maleimide",
+  "drug_linker_smiles": "CC[C@H](C)[C@@H]([C@@H](CC(=O)N1CCC[C@H]1[C@H](OC)[C@@H](C)C(=O)N[C@H](C)[C@@H](O)c1ccccc1)OC)N(C)C(=O)[C@@H](NC(=O)[C@H](C(C)C)N(C)C(=O)OCc1ccc(NC(=O)[C@H](CCCNC(N)=O)NC(=O)[C@@H](NC(=O)CCCCCN2C(=O)C=CC2=O)C(C)C)cc1)C(C)C",
+  "linker_only_smiles": "*C(=O)OCc1ccc(NC(=O)[C@H](CCCNC(N)=O)NC(=O)[C@@H](NC(=O)CCCCCN2C(=O)C=CC2=O)C(C)C)cc1",
+  "payload_smiles": "CC[C@H](C)[C@@H]([C@@H](CC(=O)N1CCC[C@H]1[C@H](OC)[C@@H](C)C(=O)N[C@H](C)[C@@H](O)c1ccccc1)OC)N(C)C(=O)[C@@H](NC(=O)[C@@H](NC)C(C)C)C(C)C",
+  "provenance": "Same drug-linker molecule as brentuximab vedotin; antibody is the fully human anti-Nectin-4 IgG1-kappa AGS-22C3. Drug-specific confirmation: the PADCEV prescribing-information Description (pfizermedicalinformation.com/padcev/description) states MMAE attached via the protease-cleavable maleimidocaproyl valine-citrulline linker, explicitly naming the reagent SGD-1006 (which is a PubChem synonym of C"
+ },
+ {
+  "brand": "Tivdak",
+  "inn": "tisotumab vedotin (tisotumab vedotin-tftv)",
+  "cleavable": true,
+  "handle": "maleimide",
+  "drug_linker_smiles": "CC[C@H](C)[C@@H]([C@@H](CC(=O)N1CCC[C@H]1[C@H](OC)[C@@H](C)C(=O)N[C@H](C)[C@@H](O)c1ccccc1)OC)N(C)C(=O)[C@@H](NC(=O)[C@H](C(C)C)N(C)C(=O)OCc1ccc(NC(=O)[C@H](CCCNC(N)=O)NC(=O)[C@@H](NC(=O)CCCCCN2C(=O)C=CC2=O)C(C)C)cc1)C(C)C",
+  "linker_only_smiles": "*C(=O)OCc1ccc(NC(=O)[C@H](CCCNC(N)=O)NC(=O)[C@@H](NC(=O)CCCCCN2C(=O)C=CC2=O)C(C)C)cc1",
+  "payload_smiles": "CC[C@H](C)[C@@H]([C@@H](CC(=O)N1CCC[C@H]1[C@H](OC)[C@@H](C)C(=O)N[C@H](C)[C@@H](O)c1ccccc1)OC)N(C)C(=O)[C@@H](NC(=O)[C@@H](NC)C(C)C)C(C)C",
+  "provenance": "Same drug-linker molecule as brentuximab vedotin; antibody is the human anti-tissue-factor IgG1-kappa. Drug-specific confirmation: ADCdb entry DRG0PNJIT lists Linker Name = Mc-Val-Cit-PABC, payload MMAE, conjugate type random cysteines, DAR 4. Second, independent: the TIVDAK prescribing-information Description (pfizermedicalinformation.com/tivdak/description) and the EMA Tivdak EPAR product inform"
+ },
+ {
+  "brand": "Aidixi",
+  "inn": "disitamab vedotin",
+  "cleavable": true,
+  "handle": "maleimide",
+  "drug_linker_smiles": "CC[C@H](C)[C@@H]([C@@H](CC(=O)N1CCC[C@H]1[C@H](OC)[C@@H](C)C(=O)N[C@H](C)[C@@H](O)c1ccccc1)OC)N(C)C(=O)[C@@H](NC(=O)[C@H](C(C)C)N(C)C(=O)OCc1ccc(NC(=O)[C@H](CCCNC(N)=O)NC(=O)[C@@H](NC(=O)CCCCCN2C(=O)C=CC2=O)C(C)C)cc1)C(C)C",
+  "linker_only_smiles": "*C(=O)OCc1ccc(NC(=O)[C@H](CCCNC(N)=O)NC(=O)[C@@H](NC(=O)CCCCCN2C(=O)C=CC2=O)C(C)C)cc1",
+  "payload_smiles": "CC[C@H](C)[C@@H]([C@@H](CC(=O)N1CCC[C@H]1[C@H](OC)[C@@H](C)C(=O)N[C@H](C)[C@@H](O)c1ccccc1)OC)N(C)C(=O)[C@@H](NC(=O)[C@@H](NC)C(C)C)C(C)C",
+  "provenance": "Same drug-linker molecule as brentuximab vedotin; antibody is RemeGen's humanised anti-HER2 IgG1 disitamab (hertuzumab). Drug-specific confirmation: ADCdb entry DRG0JEVIM gives Linker Name = Mc-Val-Cit-PABC, payload MMAE, conjugate type random cysteines, combination type 'vedotin', DAR 4, approved 2021 (NMPA conditional marketing authorisation). Second source: Selleckchem and BroadPharm product pa"
+ },
+ {
+  "brand": "Enhertu",
+  "inn": "trastuzumab deruxtecan (fam-trastuzumab deruxtecan-nxki, DS-8201a, T-DXd)",
+  "cleavable": true,
+  "handle": "maleimide",
+  "drug_linker_smiles": "CC[C@@]1(C2=C(COC1=O)C(=O)N3CC4=C5[C@H](CCC6=C5C(=CC(=C6C)F)N=C4C3=C2)NC(=O)COCNC(=O)CNC(=O)[C@H](CC7=CC=CC=C7)NC(=O)CNC(=O)CNC(=O)CCCCCN8C(=O)C=CC8=O)O",
+  "linker_only_smiles": "*CNC(=O)CNC(=O)[C@H](Cc1ccccc1)NC(=O)CNC(=O)CNC(=O)CCCCCN1C(=O)C=CC1=O",
+  "payload_smiles": "CC[C@@]1(O)C(=O)OCc2c1cc1n(c2=O)Cc2c-1nc1cc(F)c(C)c3c1c2[C@@H](NC(=O)CO)CC3",
+  "provenance": "Primary: PubChem CID 118305111 (name 'deruxtecan', CAS 1599440-13-7), SMILES taken verbatim from the PUG-REST property endpoint, C52H56FN9O13 / MW 1034.1 / InChIKey WXNSCLIZKHLNSG-MCZRLCSDSA-N. Independent cross-check 1: FDA GSRS/UNII 5SEB972CO4, record name 'DERUXTECAN PYRROLE-2,5-DIONE', formula C52H56FN9O13, mwt 1034.0539, hash WXNSCLIZKHLNSG_MCZRLCSDSA_N \u2014 I re-canonicalised the GSRS SMILES in"
+ },
+ {
+  "brand": "Trodelvy",
+  "inn": "sacituzumab govitecan (sacituzumab govitecan-hziy, IMMU-132); drug-linker = CL2A-SN-38, CAS 1279680-68-0",
+  "cleavable": true,
+  "handle": "maleimide",
+  "drug_linker_smiles": "CCC1=C2CN3C(=CC4=C(C3=O)COC(=O)[C@@]4(CC)OC(=O)OCC5=CC=C(C=C5)NC(=O)[C@H](CCCCN)NC(=O)COCC(=O)NCCOCCOCCOCCOCCOCCOCCOCCOCCN6C=C(N=N6)CNC(=O)C7CCC(CC7)CN8C(=O)C=CC8=O)C2=NC9=C1C=C(C=C9)O",
+  "linker_only_smiles": "*OC(=O)OCc1ccc(NC(=O)[C@H](CCCCN)NC(=O)COCC(=O)NCCOCCOCCOCCOCCOCCOCCOCCOCCn2cc(CNC(=O)C3CCC(CN4C(=O)C=CC4=O)CC3)nn2)cc1",
+  "payload_smiles": "CCc1c2c(nc3ccc(O)cc13)-c1cc3c(c(=O)n1C2)COC(=O)C3CC",
+  "provenance": "Primary: PubChem CID 89983570 ('CL2A-SN-38', CAS 1279680-68-0), SMILES verbatim from PUG-REST, C73H97N11O22 / MW 1480.6 / InChIKey CMVRBCDBISKHME-URBSQPMJSA-N. Independent cross-check 1 (strongest): FDA GSRS 'GOVITECAN CYSTEINYL CONJUGATE', UNII DA64T2C2IO, C76H104N12O24S, mwt 1601.774. I took the GSRS SMILES into RDKit, deleted the cysteine fragment at the S-C bond and restored the succinimide C-"
+ },
+ {
+  "brand": "Datroway",
+  "inn": "datopotamab deruxtecan (datopotamab deruxtecan-dlnk, DS-1062, Dato-DXd)",
+  "cleavable": true,
+  "handle": "maleimide",
+  "drug_linker_smiles": "CC[C@@]1(C2=C(COC1=O)C(=O)N3CC4=C5[C@H](CCC6=C5C(=CC(=C6C)F)N=C4C3=C2)NC(=O)COCNC(=O)CNC(=O)[C@H](CC7=CC=CC=C7)NC(=O)CNC(=O)CNC(=O)CCCCCN8C(=O)C=CC8=O)O",
+  "linker_only_smiles": "*CNC(=O)CNC(=O)[C@H](Cc1ccccc1)NC(=O)CNC(=O)CNC(=O)CCCCCN1C(=O)C=CC1=O",
+  "payload_smiles": "CC[C@@]1(O)C(=O)OCc2c1cc1n(c2=O)Cc2c-1nc1cc(F)c(C)c3c1c2[C@@H](NC(=O)CO)CC3",
+  "provenance": "The drug-linker is the SAME MOLECULE as Enhertu's; the only difference between the two products is the antibody and the DAR. I did not assume this from the shared INN stem, I confirmed it in FDA's own substance registry: GSRS record 'Datopotamab Deruxtecan' UNII GD2OWY1DTK (substanceClass protein) carries structuralModification AMINO_ACID_SUBSTITUTION with molecularFragment 'CYSTEINYL DERUXTECAN' "
+ },
+ {
+  "brand": "Zynlonta",
+  "inn": "loncastuximab tesirine",
+  "cleavable": true,
+  "handle": "maleimide",
+  "drug_linker_smiles": "CC1=CN2[C@@H](C1)C=NC3=CC(=C(C=C3C2=O)OC)OCCCCCOC4=C(C=C5C(=C4)N([C@H]([C@@H]6CC(=CN6C5=O)C)O)C(=O)OCC7=CC=C(C=C7)NC(=O)[C@H](C)NC(=O)[C@H](C(C)C)NC(=O)CCOCCOCCOCCOCCOCCOCCOCCOCCNC(=O)CCN8C(=O)C=CC8=O)OC",
+  "linker_only_smiles": "*C(=O)OCc1ccc(NC(=O)[C@H](C)NC(=O)[C@@H](NC(=O)CCOCCOCCOCCOCCOCCOCCOCCOCCNC(=O)CCN2C(=O)C=CC2=O)C(C)C)cc1",
+  "payload_smiles": "COc1cc2c(cc1OCCCCCOc1cc3c(cc1OC)C(=O)N1C=C(C)C[C@H]1[C@H](O)N3)N=C[C@@H]1CC(C)=CN1C2=O",
+  "provenance": "PRIMARY: PubChem CID 73672523, retrieved via PUG-REST IsomericSMILES. PubChem synonyms for that CID are 'Tesirine', CAS 1595275-62-9, UNII 8DVQ435K46, 'SG3249', 'PBD-3249' -- i.e. this CID IS the INN-registered drug-linker moiety, not the whole conjugate. Structure was deposited independently by ChemIDplus/NLM (SID 348351291, carrying the UNII) and by SureChEMBL patent extraction (SIDs 240600975, "
+ },
+ {
+  "brand": "Mylotarg",
+  "inn": "gemtuzumab ozogamicin",
+  "cleavable": true,
+  "handle": "carboxylic_acid",
+  "drug_linker_smiles": "CCN([C@H]1CO[C@H](C[C@@H]1OC)O[C@@H]2[C@H]([C@@H]([C@H](O[C@H]2O[C@H]3C#C/C=C\\C#C[C@@]\\4(CC(=O)C(=C3/C4=C\\CSSC(C)(C)CC(=O)N/N=C(\\C)/C5=CC=C(C=C5)OCCCC(=O)O)NC(=O)OC)O)C)NO[C@H]6C[C@@H]([C@@H]([C@H](O6)C)SC(=O)C7=C(C(=C(C(=C7OC)OC)O[C@H]8[C@@H]([C@@H]([C@H]([C@@H](O8)C)O)OC)O)I)C)O)O)C(=O)C",
+  "linker_only_smiles": "*SC(C)(C)CC(=O)N/N=C(\\C)c1ccc(OCCCC(=O)O)cc1",
+  "payload_smiles": "CCN(C(C)=O)[C@H]1CO[C@@H](O[C@H]2[C@H](O[C@H]3C#C/C=C\\C#C[C@]4(O)CC(=O)C(NC(=O)OC)=C3/C4=C\\CS)O[C@H](C)[C@@H](NO[C@H]3C[C@H](O)[C@H](SC(=O)c4c(C)c(I)c(O[C@@H]5O[C@@H](C)[C@H](O)[C@@H](OC)[C@H]5O)c(OC)c4OC)[C@@H](C)O3)[C@@H]2O)C[C@@H]1OC",
+  "provenance": "PRIMARY: PubChem CID 9942071, synonyms 'OZOGAMICIN', 'Ozogamicin [INN]', CAS 400046-53-9, UNII EDM24GA51F -- the INN-registered drug-linker moiety. Deposited independently by ChemIDplus/NLM (SID 135288301, carrying the UNII), Thomson Pharma (SID 14915439), DiscoveryGate (SID 24213891) and one further source, all standardising to the same CID. CROSS-CHECK 1 (strongest): the Wikipedia 'Ozogamicin' a"
+ },
+ {
+  "brand": "Besponsa",
+  "inn": "inotuzumab ozogamicin",
+  "cleavable": true,
+  "handle": "carboxylic_acid",
+  "drug_linker_smiles": "CCN([C@H]1CO[C@H](C[C@@H]1OC)O[C@@H]2[C@H]([C@@H]([C@H](O[C@H]2O[C@H]3C#C/C=C\\C#C[C@@]\\4(CC(=O)C(=C3/C4=C\\CSSC(C)(C)CC(=O)N/N=C(\\C)/C5=CC=C(C=C5)OCCCC(=O)O)NC(=O)OC)O)C)NO[C@H]6C[C@@H]([C@@H]([C@H](O6)C)SC(=O)C7=C(C(=C(C(=C7OC)OC)O[C@H]8[C@@H]([C@@H]([C@H]([C@@H](O8)C)O)OC)O)I)C)O)O)C(=O)C",
+  "linker_only_smiles": "*SC(C)(C)CC(=O)N/N=C(\\C)c1ccc(OCCCC(=O)O)cc1",
+  "payload_smiles": "CCN(C(C)=O)[C@H]1CO[C@@H](O[C@H]2[C@H](O[C@H]3C#C/C=C\\C#C[C@]4(O)CC(=O)C(NC(=O)OC)=C3/C4=C\\CS)O[C@H](C)[C@@H](NO[C@H]3C[C@H](O)[C@H](SC(=O)c4c(C)c(I)c(O[C@@H]5O[C@@H](C)[C@H](O)[C@@H](OC)[C@H]5O)c(OC)c4OC)[C@@H](C)O3)[C@@H]2O)C[C@@H]1OC",
+  "provenance": "SAME MOLECULE AS THE MYLOTARG ROW -- this is deliberate, not duplication. 'Ozogamicin' is a single INN-registered drug-linker moiety (PubChem CID 9942071, CAS 400046-53-9, UNII EDM24GA51F) used unchanged in both products. Evidence: (1) the Pfizer BESPONSA prescribing information describes the linker as 'an acid-cleavable linker composed of the condensation product of 4-(4'-acetylphenoxy)-butanoic "
+ },
+ {
+  "brand": "Blenrep",
+  "inn": "belantamab mafodotin",
+  "cleavable": false,
+  "handle": "maleimide",
+  "drug_linker_smiles": "CC[C@H](C)[C@@H]([C@@H](CC(=O)N1CCC[C@H]1[C@@H]([C@@H](C)C(=O)N[C@@H](CC2=CC=CC=C2)C(=O)O)OC)OC)N(C)C(=O)[C@H](C(C)C)NC(=O)[C@H](C(C)C)N(C)C(=O)CCCCCN3C(=O)C=CC3=O",
+  "linker_only_smiles": "*C(=O)CCCCCN1C(=O)C=CC1=O",
+  "payload_smiles": "CC[C@H](C)[C@@H]([C@@H](CC(=O)N1CCC[C@H]1[C@H](OC)[C@@H](C)C(=O)N[C@@H](Cc1ccccc1)C(=O)O)OC)N(C)C(=O)[C@@H](NC(=O)[C@@H](NC)C(C)C)C(C)C",
+  "provenance": "PubChem CID 56949327, name 'mafodotin' (the INN moiety) = mc-MMAF, C49H76N6O11, MW 925.2, maleimide already intact and MMAF C-terminus already the free acid, so I used it verbatim with no editing. Independent cross-check: NCATS/GSRS 'CYSTEINYL-MAFODOTIN' C52H83N7O13S MW 1046.32 = this molecule + cysteine (C3H7NO2S, 121.16) exactly, i.e. two sources agree on the pre-conjugation structure. linker_on"
+ },
+ {
+  "brand": "Emrelis",
+  "inn": "telisotuzumab vedotin",
+  "cleavable": true,
+  "handle": "maleimide",
+  "drug_linker_smiles": "CC[C@H](C)[C@@H]([C@@H](CC(=O)N1CCC[C@H]1[C@@H]([C@@H](C)C(=O)N[C@H](C)[C@H](C2=CC=CC=C2)O)OC)OC)N(C)C(=O)[C@H](C(C)C)NC(=O)[C@H](C(C)C)N(C)C(=O)OCC3=CC=C(C=C3)NC(=O)[C@H](CCCNC(=O)N)NC(=O)[C@H](C(C)C)NC(=O)CCCCCN4C(=O)C=CC4=O",
+  "linker_only_smiles": "*C(=O)OCc1ccc(NC(=O)[C@H](CCCNC(N)=O)NC(=O)[C@@H](NC(=O)CCCCCN2C(=O)C=CC2=O)C(C)C)cc1",
+  "payload_smiles": "CC[C@H](C)[C@@H]([C@@H](CC(=O)N1CCC[C@H]1[C@H](OC)[C@@H](C)C(=O)N[C@H](C)[C@@H](O)c1ccccc1)OC)N(C)C(=O)[C@@H](NC(=O)[C@@H](NC)C(C)C)C(C)C",
+  "provenance": "PubChem CID 46944733 ('mc-vc-PAB-MMAE' / 'MC-Val-Cit-PAB-MMAE'), C68H105N11O15, MW 1316.6, maleimide intact. Cross-check 1: NCATS/GSRS 'Cysteinyl vedotin' C71H112N12O17S MW 1437.79 = this + cysteine exactly. Cross-check 2: YOUR OWN SANITY ANCHOR -- you said brentuximab vedotin's drug-linker is ~MW 1316 and ~96 heavy atoms; I measure 1316.65 and 94 heavy atoms, so this SMILES IS the anchor compound"
+ },
+ {
+  "brand": "Decnupaz",
+  "inn": "pivekimab sunirine",
+  "cleavable": true,
+  "handle": "maleimide",
+  "drug_linker_smiles": "C[C@@H](C(=O)N[C@@H](C)C(=O)NC1=CC(=CC(=C1)COC2=C(C=C3C(=C2)N[C@H]([C@@H]4CC5=CC=CC=C5N4C3=O)S(=O)(=O)O)OC)COC6=C(C=C7C(=C6)NC[C@@H]8CC9=CC=CC=C9N8C7=O)OC)NC(=O)CCCCC(=O)NCCN1C(=O)C=CC1=O",
+  "linker_only_smiles": "*C(=O)[C@H](C)NC(=O)[C@H](C)NC(=O)CCCCC(=O)NCCN1C(=O)C=CC1=O",
+  "payload_smiles": "COc1cc2c(cc1OCc1cc(N)cc(COc3cc4c(cc3OC)C(=O)N3c5ccccc5C[C@H]3[C@H](S(=O)(=O)O)N4)c1)NC[C@@H]1Cc3ccccc3N1C2=O",
+  "provenance": "PubChem CID 163184692, name 'sunirine', C60H63N9O15S, MW 1182.3, maleimide intact. Cross-check: NCATS/GSRS 'SUNIRINE' gives the SAME formula C60H63N9O15S, MW 1182.2619, and a character-for-character equivalent SMILES. Two independent sources, no disagreement. This one post-dates the ADCs you named: FDA approval May 2026, anti-CD123, for blastic plasmacytoid dendritic cell neoplasm; the Antibody So"
+ }
+]
