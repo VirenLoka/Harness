@@ -157,9 +157,16 @@ REPAIRED: none
 
 
 def describe_problems(assessment: Assessment) -> str:
-    """The failures, each with what to do about it."""
+    """The failures, each with what to do about it.
+
+    `SUPPRESSED_CODES` is applied here too. The row-based path already
+    filtered it; without this, the headless repair run still handed the agent
+    "improve drug-likeness" while the system prompt forbade exactly that.
+    """
     lines: list[str] = []
     for code in assessment.failure_codes:
+        if code in SUPPRESSED_CODES:
+            continue
         what = HARD_FAILURES.get(code) or SOFT_FAILURES.get(code) or code
         remedy = REMEDIES.get(code)
         lines.append(f"- {code}: {what}." + (f" {remedy}" if remedy else ""))
@@ -293,19 +300,30 @@ PROTACs are around 900 Da and violate Lipinski by construction. Do not
 optimise QED. Do not reduce molecular weight toward typical drug ranges.
 Doing either makes the molecule worse at its job.
 
-WHAT A GOOD LINKER LOOKS LIKE, measured from 128 published PROTACs and from
-the passing samples of this run:
-  - spans 8 to 13 bonds between the two fragments, never below 7 or above 17
-  - 8 to 14 heavy atoms
+WHAT A GOOD LINKER LOOKS LIKE. These describe the LINKER itself, measured
+from 128 published PROTACs:
+  - spans 8 to 17 bonds between the two fragments, and never fewer than 7
   - built from chemistry a lab runs routinely: amide, PEG ether, short alkyl,
     piperazine, piperidine, triazole, sulfonamide, carbamate
-  - SA score at or below 4.9
-  - cLogP between 3.5 and 5.6
-  - TPSA at or above 170
   - contains NO reactive or unstable group: no aldehyde, in-chain ketone,
     imine, Michael acceptor, epoxide, aziridine, acyl halide, anhydride,
     vinyl ether, enol, allene, peroxide or nitroso. These react with protein
     lysines and cysteines in vivo, or do not survive as drawn.
+
+LIMITS ON THE WHOLE MOLECULE. These are properties of the entire PROTAC, not
+of the linker, and the fragments already account for most of each one. 80% of
+published PROTACs satisfy all four at once, so treat them as limits not to
+cross rather than targets to hit:
+  - SA score at or below 6.0        (published median 4.7)
+  - cLogP at or below 7.5           (published median 5.0)
+  - TPSA at or above 120            (published median 213)
+  - rotatable bonds at or below 30  (published median 18)
+
+Your real objective is simpler than those numbers: fix the stated problem
+without making any of the four worse than it already is. The task tells you
+the starting value for each. A repair that solves the problem and leaves them
+roughly where they were is a success; one that trades a fixed problem for a
+new limit breach is not.
 
 TOOLS available to you:
 
@@ -319,15 +337,11 @@ TOOLS available to you:
       Does it parse, and what did RDKit complain about.
 
   mcp__molbench__get_molecule_metrics(smiles)
-      SA score, QED, exact mass, heavy atoms, formula.
+      SA score, cLogP, TPSA, rotatable bonds, QED, exact mass, heavy atoms,
+      formula. This is where every number in the limits above comes from.
 
   mcp__molbench__apply_smarts_reaction(smiles, reaction_smarts)
       Apply a transformation and get the products back.
-
-  benchmark_transformation(smiles, reaction_smarts)
-      The same transformation, but validated and scored in one call, with
-      the products ranked by how much they improve SA. Prefer this over
-      apply_smarts_reaction followed by get_molecule_metrics on each.
 
   mcp__molbench__render_molecule_2d(smiles, filename_prefix)
       A picture. Worth one call to confirm you edited the linker and not a
@@ -342,8 +356,8 @@ TOOLS available to you:
 Docking tools exist on this server and are NOT useful here. A PROTAC binds
 two proteins at once, and docking scores one ligand into one rigid receptor,
 so it does not measure what decides whether a PROTAC works. These molecules
-also have around 26 rotatable bonds, far beyond where that search is
-reliable.
+also have around 18 rotatable bonds at the median, far beyond where that
+search stays reliable.
 
 MEASUREMENT DISCIPLINE. Never state a number you did not get from a tool. If
 you believe a change lowered cLogP, call get_molecule_metrics and read it.
@@ -368,9 +382,14 @@ FINISH your reply with exactly one line, and nothing after it:
 
 REPAIRED: <the full repaired PROTAC SMILES>
 
-If you cannot repair it without changing a fragment, finish with:
+If you cannot repair it without changing a fragment, or you exhausted your
+three approaches without check_protac_linker returning ok, finish with:
 
 REPAIRED: none
+
+If you have a molecule that fixes the stated problem but still breaches a
+limit, report it with REPAIRED: and say which limit, above the line. A
+partial repair is a result; a silent one is not.
 
 and say above that line what you tried and why it failed. A truthful failure
 is worth more than a molecule that scores well by cheating.

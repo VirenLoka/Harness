@@ -43,7 +43,7 @@ from fastmcp.tools import ToolResult
 from fastmcp.utilities.types import Image
 from pydantic import Field
 from rdkit import Chem, rdBase
-from rdkit.Chem import QED, AllChem, Descriptors, RDConfig, rdDepictor, rdMolDescriptors
+from rdkit.Chem import Crippen, QED, AllChem, Descriptors, RDConfig, rdDepictor, rdMolDescriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 
 import docking
@@ -108,6 +108,12 @@ def _metrics(mol: Chem.Mol) -> dict[str, Any]:
         "qed": round(float(QED.qed(mol)), 4),
         "num_heavy_atoms": int(mol.GetNumHeavyAtoms()),
         "formula": rdMolDescriptors.CalcMolFormula(mol),
+        # cLogP and TPSA were reachable only through get_sbdd_metrics, which
+        # needs a docking score. An agent told to optimise polarity and
+        # forbidden from claiming unmeasured numbers could do neither.
+        "clogp": round(float(Crippen.MolLogP(mol)), 4),
+        "tpsa": round(float(rdMolDescriptors.CalcTPSA(mol)), 2),
+        "num_rotatable_bonds": int(rdMolDescriptors.CalcNumRotatableBonds(mol)),
     }
 
 
@@ -687,6 +693,38 @@ def _fragment_query(smiles: str) -> Chem.Mol:
     return query
 
 
+def _span_through_linker(
+    mol: Chem.Mol,
+    linker: set[int],
+    start_gateways: set[int],
+    end_gateways: set[int],
+) -> int | None:
+    """Bonds from one fragment to the other, counted through the linker.
+
+    Breadth-first over linker atoms only, plus one bond at each end for the
+    two crossings. Returns None when the two sides are not connected through
+    the linker, which is itself the answer for a molecule that fell apart.
+    """
+    if not start_gateways or not end_gateways:
+        return None
+
+    from collections import deque
+
+    distance = {atom: 0 for atom in start_gateways}
+    queue = deque(start_gateways)
+    while queue:
+        current = queue.popleft()
+        if current in end_gateways:
+            # two crossing bonds, plus the bonds walked inside the linker
+            return distance[current] + 2
+        for neighbour in mol.GetAtomWithIdx(current).GetNeighbors():
+            index = neighbour.GetIdx()
+            if index in linker and index not in distance:
+                distance[index] = distance[current] + 1
+                queue.append(index)
+    return None
+
+
 @mcp.tool
 def check_protac_linker(
     smiles: Annotated[str, Field(description="SMILES of the whole PROTAC")],
@@ -725,26 +763,45 @@ def check_protac_linker(
 
     # Match each fragment without letting the two matches overlap, so one
     # fragment appearing twice cannot stand in for a missing other.
-    claimed: set[int] = set()
-    matched: list[tuple[int, ...]] = []
-    missing: list[int] = []
-    for index, fragment in enumerate((fragment_1, fragment_2), start=1):
-        query = _fragment_query(fragment)
-        chosen = next(
-            (
-                match
-                for match in mol.GetSubstructMatches(query, uniquify=True)
-                if not claimed.intersection(match)
-            ),
-            None,
-        )
-        if chosen is None:
-            missing.append(index)
-            continue
-        claimed.update(chosen)
-        matched.append(chosen)
+    # Search both assignments rather than taking the first match that fits.
+    # Greedy first-fit is order-dependent: a fragment with a repeated motif --
+    # and a thalidomide-derived E3 ligand has several -- can claim atoms that
+    # block the other fragment, reporting a perfectly good repair as a
+    # deleted fragment.
+    #
+    # useChirality is on, so an epimerised fragment is a *different* fragment.
+    # Without it, inverting a stereocentre in the warhead passes as intact.
+    options_1 = mol.GetSubstructMatches(
+        _fragment_query(fragment_1), uniquify=True, useChirality=True
+    )
+    options_2 = mol.GetSubstructMatches(
+        _fragment_query(fragment_2), uniquify=True, useChirality=True
+    )
 
-    fragments_intact = not missing
+    matched: list[tuple[int, ...]] = []
+    for first in options_1:
+        first_set = set(first)
+        second = next((m for m in options_2 if not first_set.intersection(m)), None)
+        if second is not None:
+            matched = [first, second]
+            break
+
+    missing: list[int] = []
+    if not matched:
+        if not options_1:
+            missing.append(1)
+        if not options_2:
+            missing.append(2)
+        if not missing:
+            # Both occur, but never disjointly: they overlap, so one of them
+            # is not really there as a separate piece.
+            issues.append(
+                "the two fragments cannot both be found without overlapping, "
+                "so at least one is not present as a distinct fragment"
+            )
+    claimed: set[int] = {i for match in matched for i in match}
+
+    fragments_intact = bool(matched)
     for index in missing:
         issues.append(
             f"fragment {index} is not present intact; the molecule is a "
@@ -784,13 +841,27 @@ def check_protac_linker(
     # that touch a fragment. The two differ exactly where it matters: a
     # one-atom linker bonded to both fragments is a single atom making two
     # bonds, and counting atoms would call it non-bridging.
+    fragment_of = {}
+    for which, match in enumerate(matched):
+        for atom in match:
+            fragment_of[atom] = which
+
     anchors: set[int] = set()
     crossings = 0
+    touched: set[int] = set()
+    # Linker atoms bonded to each fragment, which is where a span through the
+    # linker has to start and end.
+    gateways: dict[int, set[int]] = {0: set(), 1: set()}
     for index in linker_indices:
         for neighbour in mol.GetAtomWithIdx(index).GetNeighbors():
-            if neighbour.GetIdx() not in linker_set:
+            other = neighbour.GetIdx()
+            if other not in linker_set:
                 crossings += 1
-                anchors.add(neighbour.GetIdx())
+                anchors.add(other)
+                which = fragment_of.get(other)
+                if which is not None:
+                    touched.add(which)
+                    gateways[which].add(index)
 
     result["attachment_bonds"] = crossings
     if crossings != 2:
@@ -798,19 +869,26 @@ def check_protac_linker(
             f"the linker is bonded to the fragments {crossings} time(s); a "
             "linker must bridge at exactly two, one per fragment"
         )
+    elif len(touched) < 2:
+        # Two bonds onto the SAME fragment is not a bridge: the other
+        # fragment is fused straight onto the first with no linker between.
+        issues.append(
+            "both of the linker's bonds go to the same fragment, so it does "
+            "not bridge them; the two fragments are joined directly"
+        )
 
     with rdBase.BlockLogs():
         result["linker_smiles"] = Chem.MolFragmentToSmiles(
             mol, atomsToUse=linker_indices, canonical=True
         )
 
-    ordered = sorted(anchors)
-    if len(ordered) >= 2:
-        try:
-            path = Chem.GetShortestPath(mol, ordered[0], ordered[1])
-            result["span_bonds"] = max(len(path) - 1, 0) or None
-        except Exception:  # noqa: BLE001 - an unreachable pair is a result
-            result["span_bonds"] = None
+    # Walk the LINKER, not the molecule. GetShortestPath over the whole
+    # graph happily routes through a fragment, which reports a short span for
+    # a long linker whenever the two fragments are fused or share a ring --
+    # the opposite of what the number is for.
+    result["span_bonds"] = _span_through_linker(
+        mol, linker_set, gateways[0], gateways[1]
+    )
 
     reactive = []
     for name, query in _linker_queries():

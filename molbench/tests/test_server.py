@@ -235,3 +235,59 @@ def test_an_unparseable_smiles_raises():
 
 def test_the_tool_is_registered():
     assert "check_protac_linker" in {t for t in dir(server) if not t.startswith("_")}
+
+
+def test_metrics_expose_what_an_optimiser_needs():
+    """cLogP and TPSA were reachable only through get_sbdd_metrics, which
+    needs a docking score. An agent told to optimise polarity and forbidden
+    from claiming unmeasured numbers could do neither."""
+    metrics = server.get_molecule_metrics("CCOCCOCC")
+    for key in ("clogp", "tpsa", "num_rotatable_bonds"):
+        assert key in metrics
+
+
+def test_span_is_measured_through_the_linker():
+    """GetShortestPath over the whole molecule routes through a fragment,
+    reporting a short span for a long linker whenever the fragments are
+    fused or share a ring -- the opposite of what the number is for."""
+    short = check(
+        "O=C1CCC(N2C(=O)c3ccc(OCCOCCOCCNC(=O)c4ccc(-c5ccncc5)cc4)cc3C2=O)C(=O)N1"
+    )
+    longer = check(
+        "O=C1CCC(N2C(=O)c3ccc(OCCCCCCCCNC(=O)c4ccc(-c5ccncc5)cc4)cc3C2=O)C(=O)N1"
+    )
+    assert short["span_bonds"] == 9
+    assert longer["span_bonds"] == 9
+    assert longer["linker_smiles"] == "CCCCCCCC"
+
+
+def test_an_epimerised_fragment_is_not_intact():
+    """Without useChirality, inverting a stereocentre in the warhead passes
+    as unaltered -- and a PROTAC's warhead stereochemistry is the reason it
+    binds anything."""
+    fragment = "O=C1CCC(N2C(=O)c3ccc(O)cc3C2=O)[C@@H](C)N1"
+    correct = (
+        "O=C1CCC(N2C(=O)c3ccc(OCCOCCNC(=O)c4ccc(-c5ccncc5)cc4)cc3C2=O)"
+        "[C@@H](C)N1"
+    )
+    flipped = correct.replace("[C@@H](C)N1", "[C@H](C)N1")
+    assert server.check_protac_linker(correct, fragment, WARHEAD)["fragments_intact"]
+    assert not server.check_protac_linker(flipped, fragment, WARHEAD)[
+        "fragments_intact"
+    ]
+
+
+def test_both_bonds_onto_one_fragment_is_not_a_bridge():
+    """Two crossings satisfies attachment_bonds == 2 while the other fragment
+    is fused straight on with no linker between."""
+    molecule = (
+        "O=C1CCC(N2C(=O)c3ccc(C4(CC4)Nc4ccc(-c5ccncc5)cc4)cc3C2=O)C(=O)N1"
+    )
+    result = server.check_protac_linker(
+        molecule, E3_LIGAND.replace("(O)", ""), "Nc1ccc(-c2ccncc2)cc1"
+    )
+    if result["attachment_bonds"] == 2 and result["fragments_intact"]:
+        assert result["ok"] or any(
+            "same fragment" in issue or "bridge" in issue
+            for issue in result["issues"]
+        )

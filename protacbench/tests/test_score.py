@@ -263,3 +263,52 @@ def test_qed_is_not_gated_by_default():
     from protacbench.config import load_config
 
     assert load_config()["thresholds"]["min_qed"] == 0.0
+
+
+def test_the_prompt_limits_are_met_by_real_protacs():
+    """The earlier prompt set SA <= 4.9, cLogP 3.5-5.6 and TPSA >= 170 as
+    simultaneous targets. Only 22% of the 128 published PROTACs it cited as
+    its source satisfy all three at once, so it was asking for molecules
+    unlike the ground truth. Each bound here was chosen so the conjunction
+    holds for most real PROTACs."""
+    from protacbench.prompts import SYSTEM_PROMPT
+
+    for text in ("SA score at or below 6.0", "cLogP at or below 7.5",
+                 "TPSA at or above 120", "rotatable bonds at or below 30"):
+        assert text in SYSTEM_PROMPT, text
+    # and the old, unsatisfiable conjunction must not come back
+    assert "cLogP between 3.5 and 5.6" not in SYSTEM_PROMPT
+    assert "SA score at or below 4.9" not in SYSTEM_PROMPT
+
+
+def test_the_prompt_only_names_tools_that_are_mounted():
+    """`benchmark_transformation` lives in the TypeScript plugin, and
+    harness.build_patch mounts only the Python MCP server. Telling the agent
+    to prefer a tool that is not there wastes a turn on every molecule."""
+    from protacbench.prompts import SYSTEM_PROMPT
+
+    assert "benchmark_transformation" not in SYSTEM_PROMPT
+
+
+def test_the_prompt_separates_linker_from_whole_molecule_limits():
+    """TPSA >= 170 is unreachable for a linker and ordinary for a PROTAC.
+    Printed under one heading it reads as an impossible instruction."""
+    from protacbench.prompts import SYSTEM_PROMPT
+
+    assert "LIMITS ON THE WHOLE MOLECULE" in SYSTEM_PROMPT
+    assert "not\nof the linker" in SYSTEM_PROMPT
+
+
+def test_the_headless_path_suppresses_qed_too():
+    """build_prompt filtered nothing, so the headless repair run handed the
+    agent "improve drug-likeness" while the system prompt forbade it."""
+    from protacbench.assess import Assessment
+    from protacbench.prompts import build_prompt
+
+    assessment = Assessment(target_id="T", sample_id="0", stage="generated",
+                            linker_size=8)
+    assessment.add_failure("qed_too_low", "QED 0.03 below 0.05")
+    assessment.add_failure("disconnected")
+    text = build_prompt(assessment)
+    assert "qed_too_low" not in text
+    assert "disconnected" in text
