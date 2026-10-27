@@ -677,20 +677,64 @@ def _linker_queries() -> list[tuple[str, Chem.Mol]]:
 
 
 def _fragment_query(smiles: str) -> Chem.Mol:
-    """A fragment as a substructure query, tolerant of open valences.
+    """A fragment as a substructure query that actually matches.
 
-    Fragment SMILES come from cutting a molecule, so they often will not
-    sanitise on their own -- an amide nitrogen that lost its acyl partner is
-    not a legal molecule but is a perfectly good query.
+    Fragment SMILES come from cutting a molecule, and every common encoding
+    of a cut breaks a naive query in its own way:
+
+    - **Attachment dummies** (`*`, `[*]`, `[*:1]`) are how PROTAC-DB and
+      DiffLinker write fragments, and a dummy atom matches nothing in a
+      mol-mol query. They are removed; the bond they marked is the one to
+      the linker, which is not part of the fragment anyway.
+    - **Open valences** become radical electrons once sanitised, and RDKit
+      will not match a radical query atom against a filled-valence target.
+      Zeroed.
+    - **Explicit `[H]`** survives `sanitize=False` as a heavy query atom and
+      then matches nothing. Removed.
+    - **Formal charges** must match exactly, so a deprotonated phenol query
+      fails against a neutral target. Zeroed.
+
+    Raises rather than returning an unusable query: a fragment that cannot
+    be turned into one is the caller's problem, and reporting it as "the
+    molecule is a different compound" blames the wrong thing.
     """
-    query = Chem.MolFromSmiles(smiles, sanitize=False)
-    if query is None:
+    parsed = Chem.MolFromSmiles(smiles, sanitize=False)
+    if parsed is None:
         raise ToolError(f"could not parse fragment {smiles!r}")
+
+    query = Chem.RWMol(parsed)
+    drop = [
+        atom.GetIdx()
+        for atom in query.GetAtoms()
+        if atom.GetAtomicNum() == 0 or atom.GetAtomicNum() == 1
+    ]
+    for index in sorted(drop, reverse=True):
+        query.RemoveAtom(index)
+
+    for atom in query.GetAtoms():
+        atom.SetNumRadicalElectrons(0)
+        atom.SetFormalCharge(0)
+        atom.SetNoImplicit(False)
+
+    result = query.GetMol()
     try:
-        Chem.SanitizeMol(query)
-    except Exception:  # noqa: BLE001 - an unsanitisable query still matches
-        pass
-    return query
+        Chem.SanitizeMol(result)
+    except Exception:  # noqa: BLE001 - reported as the caller's problem
+        try:
+            Chem.SanitizeMol(
+                result,
+                Chem.SanitizeFlags.SANITIZE_ALL
+                ^ Chem.SanitizeFlags.SANITIZE_PROPERTIES,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise ToolError(
+                f"fragment {smiles!r} cannot be used as a substructure query: "
+                f"{exc}"
+            ) from exc
+
+    if not result.GetNumAtoms():
+        raise ToolError(f"fragment {smiles!r} has no atoms to match")
+    return result
 
 
 def _span_through_linker(
@@ -747,6 +791,15 @@ def check_protac_linker(
     good, and it will not degrade anything. Nothing else measurable catches
     that.
 
+    **A fragment query only identifies a region, not an identity.** If the
+    fragment you pass also occurs inside the other fragment -- two IMiD-based
+    ligands, say -- it can match there, and the tool will report both
+    fragments present for a molecule missing one of them. Such a molecule
+    usually fails anyway on the attachment count, but for the wrong stated
+    reason. `ambiguous_placements` counts how many disjoint placements
+    existed; anything above 1 means the derived linker is a choice rather
+    than a deduction, and `fragment_atoms` shows which one was made.
+
     `ok` covers structural invariants only: both fragments present and
     disjoint, the linker bonded to them exactly twice, and no reactive group
     in the linker. It says nothing about whether the span is right for a
@@ -763,38 +816,62 @@ def check_protac_linker(
 
     # Match each fragment without letting the two matches overlap, so one
     # fragment appearing twice cannot stand in for a missing other.
-    # Search both assignments rather than taking the first match that fits.
-    # Greedy first-fit is order-dependent: a fragment with a repeated motif --
-    # and a thalidomide-derived E3 ligand has several -- can claim atoms that
-    # block the other fragment, reporting a perfectly good repair as a
-    # deleted fragment.
+    # Choose BOTH placements together. Claiming fragment 1 first and taking
+    # the first match that fits is wrong twice over: it is order-dependent,
+    # and a generic fragment query -- an aryl amide, say, which appears in
+    # most real linkers -- lands on the linker's own chemistry before it
+    # finds the real warhead, reporting a correct molecule as broken.
     #
-    # useChirality is on, so an epimerised fragment is a *different* fragment.
-    # Without it, inverting a stereocentre in the warhead passes as intact.
-    options_1 = mol.GetSubstructMatches(
-        _fragment_query(fragment_1), uniquify=True, useChirality=True
-    )
-    options_2 = mol.GetSubstructMatches(
-        _fragment_query(fragment_2), uniquify=True, useChirality=True
-    )
+    # Among disjoint placements, prefer the one that leaves a single
+    # connected linker. That is what a real PROTAC looks like, and it is the
+    # signal that separates the right region from a coincidental match.
+    queries = (_fragment_query(fragment_1), _fragment_query(fragment_2))
+    options = [
+        mol.GetSubstructMatches(query, uniquify=True, maxMatches=200)
+        for query in queries
+    ]
 
+    def leftover_pieces(pair) -> int:
+        taken = {atom for match in pair for atom in match}
+        rest = [i for i in range(mol.GetNumAtoms()) if i not in taken]
+        if not rest:
+            return 0
+        seen: set[int] = set()
+        pieces = 0
+        for start in rest:
+            if start in seen:
+                continue
+            pieces += 1
+            stack = [start]
+            seen.add(start)
+            while stack:
+                current = stack.pop()
+                for neighbour in mol.GetAtomWithIdx(current).GetNeighbors():
+                    index = neighbour.GetIdx()
+                    if index not in seen and index not in taken:
+                        seen.add(index)
+                        stack.append(index)
+        return pieces
+
+    disjoint = [
+        (first, second)
+        for first in options[0]
+        for second in options[1]
+        if not set(first).intersection(second)
+    ]
     matched: list[tuple[int, ...]] = []
-    for first in options_1:
-        first_set = set(first)
-        second = next((m for m in options_2 if not first_set.intersection(m)), None)
-        if second is not None:
-            matched = [first, second]
-            break
+    if disjoint:
+        # One leftover piece is a proper linker; more means the match
+        # swallowed part of it. Fewest pieces wins.
+        matched = list(min(disjoint, key=leftover_pieces))
 
     missing: list[int] = []
     if not matched:
-        if not options_1:
+        if not options[0]:
             missing.append(1)
-        if not options_2:
+        if not options[1]:
             missing.append(2)
         if not missing:
-            # Both occur, but never disjointly: they overlap, so one of them
-            # is not really there as a separate piece.
             issues.append(
                 "the two fragments cannot both be found without overlapping, "
                 "so at least one is not present as a distinct fragment"
@@ -802,6 +879,32 @@ def check_protac_linker(
     claimed: set[int] = {i for match in matched for i in match}
 
     fragments_intact = bool(matched)
+
+    # Stereochemistry is checked on the chosen placement, and reported as its
+    # own failure. An epimerised warhead is present but wrong, and calling it
+    # "deleted" sends the agent to rebuild something that is already there.
+    if matched:
+        stereo_wrong = []
+        for index, query in enumerate(queries, start=1):
+            if not mol.GetSubstructMatches(
+                query, uniquify=True, useChirality=True, maxMatches=1
+            ):
+                stereo_wrong.append(index)
+        if stereo_wrong:
+            fragments_intact = False
+            for index in stereo_wrong:
+                issues.append(
+                    f"fragment {index} is present but its stereochemistry has "
+                    "been altered; a warhead's stereochemistry is the reason "
+                    "it binds anything"
+                )
+
+    if len(disjoint) > 1:
+        # Say so rather than pretending the placement was determined. A
+        # caller seeing this should treat the derived linker with suspicion.
+        result_ambiguous = len(disjoint)
+    else:
+        result_ambiguous = 0
     for index in missing:
         issues.append(
             f"fragment {index} is not present intact; the molecule is a "
@@ -819,6 +922,8 @@ def check_protac_linker(
         "attachment_bonds": None,
         "span_bonds": None,
         "reactive_groups": [],
+        "fragment_atoms": [list(match) for match in matched],
+        "ambiguous_placements": result_ambiguous,
         "issues": issues,
     }
 

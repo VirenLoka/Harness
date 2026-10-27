@@ -291,3 +291,80 @@ def test_both_bonds_onto_one_fragment_is_not_a_bridge():
             "same fragment" in issue or "bridge" in issue
             for issue in result["issues"]
         )
+
+
+# ----------------------------------- defects found by adversarial review
+
+def test_a_generic_fragment_query_does_not_land_on_the_linker():
+    """An aryl amide appears in most real linkers. Claiming fragment 1 first
+    and taking the first match that fits put the warhead query on the
+    linker's own amide, reporting a correct molecule as broken with a linker
+    that contained the warhead."""
+    molecule = (
+        "O=C1CCC(N2C(=O)c3ccc(OCCOCCNC(=O)c4ccc(CNC(=O)c5ccccc5)cc4)"
+        "cc3C2=O)C(=O)N1"
+    )
+    result = server.check_protac_linker(molecule, E3_LIGAND, "NC(=O)c1ccccc1")
+    assert result["ok"] is True
+    assert result["attachment_bonds"] == 2
+
+
+def test_the_verdict_does_not_depend_on_argument_order():
+    molecule = (
+        "O=C1CCC(N2C(=O)c3ccc(OCCOCCOCCC(=O)NC(=O)c4ccc(O)cc4)cc3C2=O)C(=O)N1"
+    )
+    warhead = "NC(=O)c1ccc(O)cc1"
+    forward = server.check_protac_linker(molecule, E3_LIGAND, warhead)
+    reverse = server.check_protac_linker(molecule, warhead, E3_LIGAND)
+    assert forward["fragments_intact"] == reverse["fragments_intact"] is True
+
+
+def test_dummy_capped_fragments_match():
+    """`*` attachment points are how PROTAC-DB and DiffLinker write
+    fragments, and a dummy atom matches nothing in a mol-mol query."""
+    result = server.check_protac_linker(
+        INTACT,
+        "O=C1CCC(N2C(=O)c3ccc(O*)cc3C2=O)C(=O)N1",
+        "*NC(=O)c1ccc(-c2ccncc2)cc1",
+    )
+    assert result["fragments_intact"] is True
+    assert result["linker_smiles"] == "CCOCCOCC"
+
+
+def test_explicit_hydrogens_and_charges_do_not_break_the_query():
+    for fragment in (
+        "[H]Oc1ccc2c(c1)C(=O)N(C1CCC(=O)NC1=O)C2=O",
+        "O=C1CCC(N2C(=O)c3ccc([O-])cc3C2=O)C(=O)N1",
+    ):
+        result = server.check_protac_linker(INTACT, fragment, WARHEAD)
+        assert result["fragments_intact"] is True, fragment
+
+
+def test_an_altered_stereocentre_says_so_rather_than_deleted():
+    """An epimerised warhead is present but wrong. Calling it deleted sends
+    the agent to rebuild something that is already there."""
+    fragment = "O=C1CCC(N2C(=O)c3ccc(O)cc3C2=O)[C@@H](C)N1"
+    correct = (
+        "O=C1CCC(N2C(=O)c3ccc(OCCOCCNC(=O)c4ccc(-c5ccncc5)cc4)cc3C2=O)"
+        "[C@@H](C)N1"
+    )
+    flipped = correct.replace("[C@@H](C)N1", "[C@H](C)N1")
+    result = server.check_protac_linker(flipped, fragment, WARHEAD)
+    assert result["fragments_intact"] is False
+    assert any("stereochemistry" in issue for issue in result["issues"])
+
+
+def test_an_unusable_fragment_blames_the_fragment_not_the_molecule():
+    with pytest.raises(ToolError, match="fragment"):
+        server.check_protac_linker(INTACT, "*", WARHEAD)
+
+
+def test_ambiguous_placements_are_reported():
+    """When a fragment can sit in more than one place the derived linker is
+    a guess, and the caller should be told."""
+    molecule = (
+        "O=C1CCC(N2C(=O)c3ccc(OCCOCCNC(=O)c4ccc(CNC(=O)c5ccccc5)cc4)"
+        "cc3C2=O)C(=O)N1"
+    )
+    result = server.check_protac_linker(molecule, E3_LIGAND, "NC(=O)c1ccccc1")
+    assert result["ambiguous_placements"] >= 2
