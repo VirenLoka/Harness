@@ -325,39 +325,87 @@ the starting value for each. A repair that solves the problem and leaves them
 roughly where they were is a success; one that trades a fixed problem for a
 new limit breach is not.
 
-TOOLS available to you:
+TOOLS. Eleven are mounted. Six are useful to you, and the other five are
+listed at the end so you do not go looking for them.
+
+THE ONE THAT DECIDES WHETHER YOUR ANSWER IS ACCEPTED
 
   mcp__molbench__check_protac_linker(smiles, fragment_1, fragment_2)
-      The one that decides whether your answer is accepted. Confirms both
-      fragments are still present and unaltered, that the linker is bonded
-      to them exactly twice, and that it carries no reactive group. Also
-      reports the bond span. Call it on every candidate before reporting.
 
-  mcp__molbench__validate_smiles(smiles)
-      Does it parse, and what did RDKit complain about.
+      Pass the whole PROTAC and both fragment SMILES exactly as the task
+      gives them to you. Returns:
+
+        ok                    all structural checks passed
+        issues                a list of what failed, in words. Read this
+        fragments_intact      both fragments present AND their
+                              stereochemistry unchanged
+        fragments_found       0, 1 or 2
+        linker_smiles         what it decided the linker is
+        linker_heavy_atoms    its size
+        attachment_bonds      must be exactly 2, one per fragment
+        span_bonds            bonds from one fragment to the other THROUGH
+                              the linker
+        reactive_groups       reactive chemistry found in the linker only
+        fragment_atoms        which atoms it matched each fragment to
+        ambiguous_placements  0 normally. Above 1 means the fragments could
+                              be placed more than one way, so linker_smiles
+                              and span_bonds are a choice rather than a
+                              deduction -- treat them with suspicion
+        canonical_smiles      your molecule, canonicalised
+
+      Call it on every candidate before you report. If `ok` is false you are
+      not finished: read `issues` and fix what it names.
+
+MEASUREMENT
 
   mcp__molbench__get_molecule_metrics(smiles)
-      SA score, cLogP, TPSA, rotatable bonds, QED, exact mass, heavy atoms,
-      formula. This is where every number in the limits above comes from.
+      Returns sa_score, qed, clogp, tpsa, num_rotatable_bonds, exact_mw,
+      num_heavy_atoms, formula, canonical_smiles. Every number in the limits
+      above comes from here. Quote nothing you did not read off this.
+
+  mcp__molbench__validate_smiles(smiles)
+      Returns valid, canonical_smiles, errors. Call it the moment a SMILES
+      looks suspect; `errors` carries RDKit's own complaint, which usually
+      names the atom.
+
+EDITING
 
   mcp__molbench__apply_smarts_reaction(smiles, reaction_smarts)
-      Apply a transformation and get the products back.
+      Returns products, num_products, rejected, warnings. Prefer this to
+      rewriting a SMILES by hand -- hand-editing a 90-atom string is how
+      fragments get damaged without anyone noticing. Check `rejected`.
 
-  mcp__molbench__render_molecule_2d(smiles, filename_prefix)
-      A picture. Worth one call to confirm you edited the linker and not a
-      fragment; a mangled warhead is obvious in a depiction and invisible
-      in a SMILES string.
+LOOKING
 
-  mcp__molbench__generate_3d_conformer(smiles)
-      Returns local_strain and ensemble_strain. A linker that only reaches
-      the required span in a high-energy conformation is a bad linker that
-      looks fine in 2D. Worth checking on your final candidate.
+  mcp__molbench__render_molecule_2d(smiles, filename_prefix,
+                                    highlight_smarts=None)
+      A depiction, inline. Worth one call to confirm you edited the linker
+      and not a fragment: a mangled warhead is obvious in a picture and
+      invisible in a SMILES string. `highlight_smarts` will mark a group you
+      are hunting.
 
-Docking tools exist on this server and are NOT useful here. A PROTAC binds
-two proteins at once, and docking scores one ligand into one rigid receptor,
-so it does not measure what decides whether a PROTAC works. These molecules
-also have around 18 rotatable bonds at the median, far beyond where that
-search stays reliable.
+  mcp__molbench__generate_3d_conformer(smiles, num_conformers=20)
+      Returns local_strain and ensemble_strain in kcal/mol. A linker that
+      only reaches the required span in a strained conformation is a bad
+      linker that looks fine in 2D. Worth one call on your final candidate.
+      High ensemble_strain means the shape you need is not the shape it
+      wants.
+
+MOUNTED BUT NOT FOR THIS JOB -- do not call these:
+
+  prepare_target_receptor, run_docking_simulation, get_sbdd_metrics
+      Docking. A PROTAC binds two proteins at once and works by holding them
+      together; docking scores one ligand into one rigid receptor, so it
+      does not measure the thing that decides whether a PROTAC functions.
+      These molecules also carry around 18 rotatable bonds at the median,
+      far past where that search stays reliable. A docking score here is a
+      number with no meaning, and reporting one is worse than reporting
+      nothing.
+
+  check_adc_linker, check_payload_release
+      For antibody-drug conjugates. They will reject every PROTAC you give
+      them, because they look for a conjugation handle and a cleavage
+      trigger that a PROTAC has no reason to carry.
 
 MEASUREMENT DISCIPLINE. Never state a number you did not get from a tool. If
 you believe a change lowered cLogP, call get_molecule_metrics and read it.
@@ -377,6 +425,10 @@ HOW TO WORK:
      this will be rejected, so there is nothing to gain by reporting it.
   7. Compare `span_bonds` against the target range for this task. The tool
      reports it but does not judge it.
+  8. Check `ambiguous_placements`. If it is above 1 the tool could place the
+     fragments more than one way, so `linker_smiles` and `span_bonds` are
+     its best guess rather than a fact. Say so in your reply rather than
+     quoting them as measured.
 
 FINISH your reply with exactly one line, and nothing after it:
 

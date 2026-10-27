@@ -333,46 +333,32 @@ def _dummy_with_map(mol: Any, map_number: int) -> int | None:
     return None
 
 
-def join(left: str, right: str, *, left_map: int = 1, right_map: int = 1) -> str:
-    """Bond `left`'s dummy to `right`'s dummy and drop both.
+def _neighbour_is_dummy(mol: Any, map_number: int) -> bool:
+    """Is this attachment point bonded to another attachment point?"""
+    index = _dummy_with_map(mol, map_number)
+    if index is None:
+        return False
+    neighbours = mol.GetAtomWithIdx(index).GetNeighbors()
+    return bool(neighbours) and neighbours[0].GetAtomicNum() == 0
 
-    The neighbours of the two dummy atoms are joined by a single bond. Any
-    dummy not named by `left_map` / `right_map` survives, which is how a
-    cassette keeps its far attachment point while its near one is consumed.
+
+def _join_through_dummies(a: Any, b: Any, map_number: int) -> str:
+    """Bond the two anchors directly and delete both attachment points.
+
+    Only used where one of the attachment points is bonded to another
+    attachment point, which `molzip` refuses. That is the `none` cassette and
+    nothing else; it carries no stereochemistry, so the neighbour-ordering
+    problem that `join` otherwise exists to avoid cannot arise here.
     """
     from rdkit import Chem
 
-    a = Chem.MolFromSmiles(left, sanitize=False)
-    b = Chem.MolFromSmiles(right, sanitize=False)
-    if a is None or b is None:
-        raise WarheadError(f"could not parse: {left!r} or {right!r}")
-
     combined = Chem.RWMol(Chem.CombineMols(a, b))
     offset = a.GetNumAtoms()
+    a_dummy = _dummy_with_map(a, map_number)
+    b_dummy = _dummy_with_map(b, map_number) + offset
+    a_anchor = combined.GetAtomWithIdx(a_dummy).GetNeighbors()[0].GetIdx()
+    b_anchor = combined.GetAtomWithIdx(b_dummy).GetNeighbors()[0].GetIdx()
 
-    a_dummy = _dummy_with_map(a, left_map)
-    b_dummy = _dummy_with_map(b, right_map)
-    if a_dummy is None:
-        raise WarheadError(f"{left!r} has no [*:{left_map}] attachment point")
-    if b_dummy is None:
-        raise WarheadError(f"{right!r} has no [*:{right_map}] attachment point")
-    b_dummy += offset
-
-    def sole_neighbour(index: int) -> int:
-        neighbours = combined.GetAtomWithIdx(index).GetNeighbors()
-        if len(neighbours) != 1:
-            raise WarheadError(
-                f"attachment point at index {index} has "
-                f"{len(neighbours)} neighbours; it must have exactly one"
-            )
-        return neighbours[0].GetIdx()
-
-    a_anchor = sole_neighbour(a_dummy)
-    b_anchor = sole_neighbour(b_dummy)
-
-    # A direct join -- the `none` cassette, which is two dummies bonded to
-    # each other -- would ask for a bond between the two anchors, which is
-    # exactly right, but the dummies must go first or the indices shift.
     combined.AddBond(a_anchor, b_anchor, Chem.BondType.SINGLE)
     for index in sorted([a_dummy, b_dummy], reverse=True):
         combined.RemoveAtom(index)
@@ -380,7 +366,85 @@ def join(left: str, right: str, *, left_map: int = 1, right_map: int = 1) -> str
     product = combined.GetMol()
     try:
         Chem.SanitizeMol(product)
+    except Exception as exc:  # noqa: BLE001
+        raise WarheadError(f"joining produced an invalid molecule: {exc}") from exc
+    return Chem.MolToSmiles(product)
+
+
+def join(left: str, right: str, *, left_map: int = 1, right_map: int = 1) -> str:
+    """Bond `left`'s dummy to `right`'s dummy and drop both.
+
+    The neighbours of the two dummy atoms are joined by a single bond. Any
+    dummy not named by `left_map` / `right_map` survives, which is how a
+    cassette keeps its far attachment point while its near one is consumed.
+
+    **This is built on `molzip` because the obvious implementation inverts
+    stereochemistry.** Adding the new bond and then deleting the dummy
+    appends that bond to the end of the anchor's bond list, while the dummy
+    had been wherever the SMILES put it. A tetrahedral centre's parity is
+    defined by neighbour order, so an attachment point written in a branch --
+    `CC[C@H]([*:1])CO`, which is how most payloads are written -- came out
+    inverted, silently and every time. An attachment written last came out
+    right, so the bug was invisible in roughly half the library.
+
+    That matters here more than it would elsewhere: the molecules being
+    joined are a payload whose potency depends on its stereocentres and a
+    cassette whose protease does. `molzip` rewires at the dummy's own
+    position and gets all four cases right.
+    """
+    from rdkit import Chem
+    from rdkit.Chem import rdmolops
+
+    a = Chem.MolFromSmiles(left, sanitize=False)
+    b = Chem.MolFromSmiles(right, sanitize=False)
+    if a is None or b is None:
+        raise WarheadError(f"could not parse: {left!r} or {right!r}")
+
+    if _dummy_with_map(a, left_map) is None:
+        raise WarheadError(f"{left!r} has no [*:{left_map}] attachment point")
+    if _dummy_with_map(b, right_map) is None:
+        raise WarheadError(f"{right!r} has no [*:{right_map}] attachment point")
+
+    for mol, which in ((a, left), (b, right)):
+        for atom in mol.GetAtoms():
+            if atom.GetAtomicNum() == 0 and len(atom.GetNeighbors()) != 1:
+                raise WarheadError(
+                    f"an attachment point in {which!r} has "
+                    f"{len(atom.GetNeighbors())} neighbours; it must have "
+                    "exactly one"
+                )
+
+    # molzip pairs dummies carrying the SAME map number, so the two being
+    # consumed are relabelled to a number no surviving dummy uses.
+    used = {
+        atom.GetAtomMapNum()
+        for mol in (a, b)
+        for atom in mol.GetAtoms()
+        if atom.GetAtomicNum() == 0
+    }
+    pair_label = max(used, default=0) + 1
+    for mol, wanted in ((a, left_map), (b, right_map)):
+        for atom in mol.GetAtoms():
+            if atom.GetAtomicNum() == 0 and atom.GetAtomMapNum() == wanted:
+                atom.SetAtomMapNum(pair_label)
+                break
+
+    # molzip cannot zip an attachment point whose only neighbour is itself a
+    # dummy, which is exactly the `none` cassette: `[*:1][*:2]`, two
+    # attachment points bonded to each other and nothing in between. There is
+    # no stereocentre anywhere near it, so the plain rewiring is safe there
+    # and only there.
+    if _neighbour_is_dummy(a, pair_label) or _neighbour_is_dummy(b, pair_label):
+        return _join_through_dummies(a, b, pair_label)
+
+    try:
+        product = rdmolops.molzip(a, b)
     except Exception as exc:  # noqa: BLE001 - a bad join is a result, not a crash
+        raise WarheadError(f"joining produced an invalid molecule: {exc}") from exc
+
+    try:
+        Chem.SanitizeMol(product)
+    except Exception as exc:  # noqa: BLE001
         raise WarheadError(f"joining produced an invalid molecule: {exc}") from exc
     return Chem.MolToSmiles(product)
 

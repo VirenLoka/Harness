@@ -389,6 +389,40 @@ def test_each_handle_pattern_matches_its_own_handle_exactly_once(name):
     )
 
 
+def test_the_repair_prompts_name_every_mounted_tool_and_invent_none():
+    """A prompt is a contract with the agent about what it can call.
+
+    Both failure modes are silent. A tool the prompt never mentions is one
+    the agent will not use -- that is how check_protac_linker went unused
+    after it was added. A tool the prompt names that is not mounted sends
+    the agent to a dead end mid-task, which is how an earlier version of
+    this prompt asked for `submit_molecule`, a tool that belongs to a
+    different package and was never on this server.
+
+    So the prompt must account for all of them, including the ones it tells
+    the agent NOT to call.
+    """
+    import re
+
+    from protacbench import prompts as protac_prompts
+
+    mounted = set(server.mcp.tools)
+    assert len(mounted) >= 11, "tool list shrank unexpectedly"
+
+    text = protac_prompts.SYSTEM_PROMPT
+    unmentioned = {name for name in mounted if name not in text}
+    assert not unmentioned, (
+        "these tools are mounted but the PROTAC system prompt never mentions "
+        f"them, so the agent will not know they exist: {sorted(unmentioned)}"
+    )
+
+    invented = set(re.findall(r"mcp__molbench__(\w+)", text)) - mounted
+    assert not invented, (
+        "the PROTAC system prompt names tools that are not mounted, which "
+        f"dead-ends the agent mid-task: {sorted(invented)}"
+    )
+
+
 def test_an_unusable_payload_query_raises_rather_than_blaming_the_molecule():
     result = call(
         "check_adc_linker", {"smiles": _conjugate("*NCCOCC*"), "payload": "not a smiles"}
