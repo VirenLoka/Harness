@@ -237,3 +237,17 @@ the invalid-input, no-match and server-error paths.
   points at the older `0.0.1-rc.1`, which has a different API (`CallId` instead
   of `ToolCallId`, and no `dsh-util-values`), so keep the versions pinned
   together when upgrading.
+
+## check_protac_linker
+
+`check_protac_linker(smiles, fragment_1, fragment_2)` answers the questions a
+SMILES string cannot be eyeballed for: are both fragments still present and
+unaltered, is the linker bonded to them exactly twice, how many bonds span
+them, and does the linker carry a reactive group.
+
+It exists because an agent repairing a PROTAC can always delete a fragment --
+the result parses, sanitises, scores well on every descriptor, and is not a
+PROTAC. No other measurement catches that.
+
+`ok` covers structural invariants only. `span_bonds` is reported and not
+judged, because the right range depends on the two proteins being bridged.

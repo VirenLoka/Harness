@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 from fastmcp import Client
+from fastmcp.exceptions import ToolError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -35,6 +36,7 @@ def test_lists_every_tool():
 
     assert sorted(asyncio.run(run())) == [
         "apply_smarts_reaction",
+        "check_protac_linker",
         "generate_3d_conformer",
         "get_molecule_metrics",
         "get_sbdd_metrics",
@@ -137,3 +139,99 @@ def test_render_prefix_cannot_escape_the_visualizations_directory():
     svg_path = Path(structured["svg_path"])
     assert svg_path.parent == server.VIZ_DIR
     assert "/" not in svg_path.name.removesuffix(".svg")
+
+
+# ------------------------------------------------------ check_protac_linker
+
+WARHEAD = "NC(=O)c1ccc(-c2ccncc2)cc1"
+E3_LIGAND = "O=C1CCC(N2C(=O)c3ccc(O)cc3C2=O)C(=O)N1"
+INTACT = (
+    "O=C1CCC(N2C(=O)c3ccc(OCCOCCOCCNC(=O)c4ccc(-c5ccncc5)cc4)cc3C2=O)C(=O)N1"
+)
+
+
+def check(smiles):
+    return server.check_protac_linker(smiles, E3_LIGAND, WARHEAD)
+
+
+def test_an_intact_protac_passes():
+    result = check(INTACT)
+    assert result["ok"] is True
+    assert result["fragments_intact"] is True
+    assert result["attachment_bonds"] == 2
+    assert result["linker_smiles"] == "CCOCCOCC"
+    assert result["span_bonds"] == 9
+    assert result["issues"] == []
+
+
+def test_a_deleted_fragment_is_caught():
+    """The failure that looks like success: the result parses, sanitises,
+    scores well, and is not a PROTAC. Nothing else measurable catches it."""
+    result = check("OCCOCCOCCNC(=O)c1ccc(-c2ccncc2)cc1")
+    assert result["ok"] is False
+    assert result["fragments_intact"] is False
+    assert any("different compound" in issue for issue in result["issues"])
+
+
+def test_a_reactive_group_in_the_linker_is_caught():
+    result = check(
+        "O=C1CCC(N2C(=O)c3ccc(OCCC(C=O)CNC(=O)c4ccc(-c5ccncc5)cc4)cc3C2=O)C(=O)N1"
+    )
+    assert result["ok"] is False
+    assert "aldehyde" in result["reactive_groups"]
+
+
+def test_a_reactive_group_in_a_fragment_is_not_the_linkers_fault():
+    """A warhead may legitimately contain chemistry a linker may not, and
+    flagging it would reject molecules for something untouched."""
+    warhead = "O=Cc1ccc(-c2ccncc2)cc1"
+    molecule = (
+        "O=C1CCC(N2C(=O)c3ccc(OCCOCCOCCc4ccc(-c5ccncc5)cc4C=O)cc3C2=O)C(=O)N1"
+    )
+    result = server.check_protac_linker(molecule, E3_LIGAND, warhead)
+    assert "aldehyde" not in result["reactive_groups"]
+
+
+def test_a_dangling_linker_is_caught():
+    result = check(
+        "O=C1CCC(N2C(=O)c3ccc(OCCOCCOCC)cc3C2=O)C(=O)N1."
+        "NC(=O)c1ccc(-c2ccncc2)cc1"
+    )
+    assert result["ok"] is False
+    assert result["attachment_bonds"] == 1
+
+
+def test_bonds_are_counted_not_atoms():
+    """A one-atom linker bonded to both fragments makes two bonds. Counting
+    linker atoms that touch a fragment would call it non-bridging."""
+    result = check(
+        "O=C1CCC(N2C(=O)c3ccc(OCNC(=O)c4ccc(-c5ccncc5)cc4)cc3C2=O)C(=O)N1"
+    )
+    assert result["attachment_bonds"] == 2
+    assert result["linker_smiles"] == "C"
+
+
+def test_a_molecule_in_pieces_says_so():
+    result = check(f"{E3_LIGAND}.{WARHEAD}")
+    assert result["ok"] is False
+    assert any("disconnected" in issue for issue in result["issues"])
+    assert any("linker is gone" in issue for issue in result["issues"])
+
+
+def test_ok_does_not_judge_the_span():
+    """Span is reported, never gated: the right range is a property of the
+    two proteins being bridged, not of the molecule."""
+    result = check(
+        "O=C1CCC(N2C(=O)c3ccc(OCNC(=O)c4ccc(-c5ccncc5)cc4)cc3C2=O)C(=O)N1"
+    )
+    assert result["ok"] is True
+    assert result["span_bonds"] == 2
+
+
+def test_an_unparseable_smiles_raises():
+    with pytest.raises(ToolError):
+        check("C(C(C")
+
+
+def test_the_tool_is_registered():
+    assert "check_protac_linker" in {t for t in dir(server) if not t.startswith("_")}

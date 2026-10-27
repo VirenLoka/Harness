@@ -637,6 +637,198 @@ def get_sbdd_metrics(
         raise ToolError(str(exc)) from exc
 
 
+# Groups that make a linker unusable however good its descriptors look. A
+# warhead may legitimately contain any of these, so they are only ever
+# reported from the linker region.
+LINKER_REACTIVE_GROUPS: tuple[tuple[str, str], ...] = (
+    ("aldehyde", "[CX3H1](=O)[#6]"),
+    ("acyl_halide", "[CX3](=[OX1])[F,Cl,Br,I]"),
+    ("anhydride", "[CX3](=[OX1])[OX2][CX3]=[OX1]"),
+    ("isocyanate", "[NX2]=[CX2]=[OX1]"),
+    ("michael_acceptor", "[CX3]=[CX3][CX3]=[OX1]"),
+    ("epoxide", "[CX4]1O[CX4]1"),
+    ("aziridine", "[CX4]1N[CX4]1"),
+    ("allene", "[CX2]=[CX2]=[CX2]"),
+    ("vinyl_ether", "[OX2;!$(O=*)][CX3]=[CX3]"),
+    ("enol", "[OX2H][CX3]=[CX3]"),
+    ("imine", "[CX3]=[NX2;H1,H0;!$(N-a);!$(N=C-N)]"),
+    ("peroxide", "[OX2][OX2]"),
+    ("nitroso", "[NX2]=[OX1]"),
+)
+
+_LINKER_QUERIES: list[tuple[str, Chem.Mol]] = []
+
+
+def _linker_queries() -> list[tuple[str, Chem.Mol]]:
+    global _LINKER_QUERIES
+    if not _LINKER_QUERIES:
+        _LINKER_QUERIES = [
+            (name, query)
+            for name, smarts in LINKER_REACTIVE_GROUPS
+            if (query := Chem.MolFromSmarts(smarts)) is not None
+        ]
+    return _LINKER_QUERIES
+
+
+def _fragment_query(smiles: str) -> Chem.Mol:
+    """A fragment as a substructure query, tolerant of open valences.
+
+    Fragment SMILES come from cutting a molecule, so they often will not
+    sanitise on their own -- an amide nitrogen that lost its acyl partner is
+    not a legal molecule but is a perfectly good query.
+    """
+    query = Chem.MolFromSmiles(smiles, sanitize=False)
+    if query is None:
+        raise ToolError(f"could not parse fragment {smiles!r}")
+    try:
+        Chem.SanitizeMol(query)
+    except Exception:  # noqa: BLE001 - an unsanitisable query still matches
+        pass
+    return query
+
+
+@mcp.tool
+def check_protac_linker(
+    smiles: Annotated[str, Field(description="SMILES of the whole PROTAC")],
+    fragment_1: Annotated[
+        str, Field(description="SMILES of the first fragment, which must be intact")
+    ],
+    fragment_2: Annotated[
+        str, Field(description="SMILES of the second fragment, which must be intact")
+    ],
+) -> dict[str, Any]:
+    """Check a PROTAC keeps both fragments and still bridges them properly.
+
+    Answers the questions a SMILES string cannot be eyeballed for: are both
+    fragments present and unaltered, is the linker bonded to them exactly
+    twice, how many bonds span the two fragments, and does the linker carry
+    a reactive group.
+
+    `fragments_intact` is the one that matters. A PROTAC missing a fragment
+    is a different compound: it parses, it sanitises, its descriptors look
+    good, and it will not degrade anything. Nothing else measurable catches
+    that.
+
+    `ok` covers structural invariants only: both fragments present and
+    disjoint, the linker bonded to them exactly twice, and no reactive group
+    in the linker. It says nothing about whether the span is right for a
+    ternary complex -- `span_bonds` is reported for the caller to judge
+    against its own target, because that range is a property of the proteins
+    being bridged, not of the molecule. `issues` says what failed in words.
+    """
+    mol = _require_mol(smiles)
+    issues: list[str] = []
+
+    pieces = Chem.GetMolFrags(mol)
+    if len(pieces) > 1:
+        issues.append(f"the molecule is in {len(pieces)} disconnected pieces")
+
+    # Match each fragment without letting the two matches overlap, so one
+    # fragment appearing twice cannot stand in for a missing other.
+    claimed: set[int] = set()
+    matched: list[tuple[int, ...]] = []
+    missing: list[int] = []
+    for index, fragment in enumerate((fragment_1, fragment_2), start=1):
+        query = _fragment_query(fragment)
+        chosen = next(
+            (
+                match
+                for match in mol.GetSubstructMatches(query, uniquify=True)
+                if not claimed.intersection(match)
+            ),
+            None,
+        )
+        if chosen is None:
+            missing.append(index)
+            continue
+        claimed.update(chosen)
+        matched.append(chosen)
+
+    fragments_intact = not missing
+    for index in missing:
+        issues.append(
+            f"fragment {index} is not present intact; the molecule is a "
+            "different compound, not a repaired linker"
+        )
+
+    linker_indices = [i for i in range(mol.GetNumAtoms()) if i not in claimed]
+    result: dict[str, Any] = {
+        "ok": False,
+        "canonical_smiles": Chem.MolToSmiles(mol),
+        "fragments_intact": fragments_intact,
+        "fragments_found": len(matched),
+        "linker_heavy_atoms": len(linker_indices),
+        "linker_smiles": None,
+        "attachment_bonds": None,
+        "span_bonds": None,
+        "reactive_groups": [],
+        "issues": issues,
+    }
+
+    if not fragments_intact:
+        return result
+
+    if not linker_indices:
+        # Which diagnosis is right depends on whether the pieces are even
+        # bonded: "joined directly" is misleading for a molecule that fell
+        # apart, where the linker is missing rather than zero-length.
+        issues.append(
+            "the fragments are not connected by anything; the linker is gone"
+            if len(pieces) > 1
+            else "the fragments are joined directly, leaving no linker"
+        )
+        return result
+
+    linker_set = set(linker_indices)
+    # Count BONDS crossing the linker/fragment boundary, not linker atoms
+    # that touch a fragment. The two differ exactly where it matters: a
+    # one-atom linker bonded to both fragments is a single atom making two
+    # bonds, and counting atoms would call it non-bridging.
+    anchors: set[int] = set()
+    crossings = 0
+    for index in linker_indices:
+        for neighbour in mol.GetAtomWithIdx(index).GetNeighbors():
+            if neighbour.GetIdx() not in linker_set:
+                crossings += 1
+                anchors.add(neighbour.GetIdx())
+
+    result["attachment_bonds"] = crossings
+    if crossings != 2:
+        issues.append(
+            f"the linker is bonded to the fragments {crossings} time(s); a "
+            "linker must bridge at exactly two, one per fragment"
+        )
+
+    with rdBase.BlockLogs():
+        result["linker_smiles"] = Chem.MolFragmentToSmiles(
+            mol, atomsToUse=linker_indices, canonical=True
+        )
+
+    ordered = sorted(anchors)
+    if len(ordered) >= 2:
+        try:
+            path = Chem.GetShortestPath(mol, ordered[0], ordered[1])
+            result["span_bonds"] = max(len(path) - 1, 0) or None
+        except Exception:  # noqa: BLE001 - an unreachable pair is a result
+            result["span_bonds"] = None
+
+    reactive = []
+    for name, query in _linker_queries():
+        for match in mol.GetSubstructMatches(query):
+            if linker_set.issuperset(match):
+                reactive.append(name)
+                break
+    result["reactive_groups"] = reactive
+    if reactive:
+        issues.append(
+            f"the linker contains {', '.join(reactive)}, which reacts with "
+            "protein nucleophiles or will not survive as drawn"
+        )
+
+    result["ok"] = not issues
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the MolBench MCP server.")
     parser.add_argument(

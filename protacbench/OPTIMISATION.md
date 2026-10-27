@@ -104,11 +104,9 @@ the passing samples of this run:
     vinyl ether, enol, allene, peroxide or nitroso. These react with protein
     lysines and cysteines in vivo or do not survive as drawn.
 
-TOOLS. You have:
-  mcp__molbench__validate_smiles(smiles)
-  mcp__molbench__get_molecule_metrics(smiles)
-  mcp__molbench__apply_smarts_reaction(smiles, reaction_smarts)
-  mcp__molbench__generate_3d_conformer(smiles)
+TOOLS. See `prompts.SYSTEM_PROMPT` for the authoritative list with
+descriptions; the important one is check_protac_linker, which decides
+whether an answer is accepted.
 
 MEASUREMENT DISCIPLINE. Never state a number you did not get from a tool. If
 you believe a change lowered cLogP, call get_molecule_metrics and read it.
@@ -136,6 +134,45 @@ REPAIRED: none
 and say above the line what you tried and why it failed. A truthful failure
 is worth more than a molecule that scores well by cheating.
 ```
+
+## The tools, and the one that matters
+
+molbench exposes ten tools. Six are useful here:
+
+| Tool | Why |
+| --- | --- |
+| `check_protac_linker` | **the one that decides acceptance** — fragments intact, bridging, reactive groups, span |
+| `benchmark_transformation` | validate, transform and score in one call, products ranked by SA improvement |
+| `validate_smiles` | does it parse, and what did RDKit object to |
+| `get_molecule_metrics` | SA, QED, mass, heavy atoms |
+| `render_molecule_2d` | a mangled warhead is obvious in a picture and invisible in a SMILES string |
+| `generate_3d_conformer` | strain — a linker that only reaches its span in a high-energy conformation is a bad linker |
+
+`check_protac_linker(smiles, fragment_1, fragment_2)` closes the gap that
+made the earlier prompt weak: the agent was asked to satisfy acceptance tests
+it had no way to measure, and had to infer fragment survival from a SMILES
+string by eye. It now checks, rather than guesses.
+
+Its `ok` covers structural invariants only — fragments present and disjoint,
+exactly two bonds to the linker, no reactive group. It reports `span_bonds`
+without judging it, because the right range is a property of the two proteins
+being bridged rather than of the molecule.
+
+### Why docking is not on that list
+
+The remaining tools are `prepare_target_receptor`, `run_docking_simulation`,
+`get_sbdd_metrics` and `dock_and_score`. They work, and they are the wrong
+instrument here.
+
+A PROTAC binds two proteins at once; whether it works is decided by the
+ternary complex. Docking scores one ligand into one rigid receptor, which
+does not model that. These molecules also have around 26 rotatable bonds at
+the median, well past where that conformational search stays reliable, and
+the score would be dominated by the warhead — the part the agent is forbidden
+to change and whose affinity is already known.
+
+Docking earns its place in `adclinker`, scoring an Fc-binding anchor against
+a real pocket. Not here.
 
 ## The per-task prompt
 

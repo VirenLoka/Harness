@@ -308,10 +308,42 @@ the passing samples of this run:
     lysines and cysteines in vivo, or do not survive as drawn.
 
 TOOLS available to you:
+
+  mcp__molbench__check_protac_linker(smiles, fragment_1, fragment_2)
+      The one that decides whether your answer is accepted. Confirms both
+      fragments are still present and unaltered, that the linker is bonded
+      to them exactly twice, and that it carries no reactive group. Also
+      reports the bond span. Call it on every candidate before reporting.
+
   mcp__molbench__validate_smiles(smiles)
+      Does it parse, and what did RDKit complain about.
+
   mcp__molbench__get_molecule_metrics(smiles)
+      SA score, QED, exact mass, heavy atoms, formula.
+
   mcp__molbench__apply_smarts_reaction(smiles, reaction_smarts)
+      Apply a transformation and get the products back.
+
+  benchmark_transformation(smiles, reaction_smarts)
+      The same transformation, but validated and scored in one call, with
+      the products ranked by how much they improve SA. Prefer this over
+      apply_smarts_reaction followed by get_molecule_metrics on each.
+
+  mcp__molbench__render_molecule_2d(smiles, filename_prefix)
+      A picture. Worth one call to confirm you edited the linker and not a
+      fragment; a mangled warhead is obvious in a depiction and invisible
+      in a SMILES string.
+
   mcp__molbench__generate_3d_conformer(smiles)
+      Returns local_strain and ensemble_strain. A linker that only reaches
+      the required span in a high-energy conformation is a bad linker that
+      looks fine in 2D. Worth checking on your final candidate.
+
+Docking tools exist on this server and are NOT useful here. A PROTAC binds
+two proteins at once, and docking scores one ligand into one rigid receptor,
+so it does not measure what decides whether a PROTAC works. These molecules
+also have around 26 rotatable bonds, far beyond where that search is
+reliable.
 
 MEASUREMENT DISCIPLINE. Never state a number you did not get from a tool. If
 you believe a change lowered cLogP, call get_molecule_metrics and read it.
@@ -326,7 +358,11 @@ HOW TO WORK:
   4. Apply it, re-measure, and check it did not break something else.
   5. Repeat until the problem is fixed, or until you have tried three
      distinct approaches.
-  6. validate_smiles on your final answer before reporting it.
+  6. check_protac_linker on your final answer. If `ok` is false, you are not
+     finished -- read `issues` and fix what it names. An answer that fails
+     this will be rejected, so there is nothing to gain by reporting it.
+  7. Compare `span_bonds` against the target range for this task. The tool
+     reports it but does not judge it.
 
 FINISH your reply with exactly one line, and nothing after it:
 
