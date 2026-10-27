@@ -1,9 +1,11 @@
-"""Commands: `probe`, `plan`, `sample`, `assess`, `repair`.
+"""Commands: `probe`, `plan`, `sample`, `assess`, `prompts`, `repair`, `grade`.
 
 `probe` and `plan` are safe anywhere and run no model pass. `sample` needs the
 GPU and refuses without one. `assess` works on files already on disk, so it
 runs on any machine. `repair` needs no GPU of its own but does need a model
-endpoint to talk to, and refuses when the harness is not ready.
+endpoint to talk to, and refuses when the harness is not ready. `prompts` and
+`grade` are the two ends of a hand-run loop: one writes paste-ready tasks, the
+other scores the replies that come back, and neither needs an endpoint.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from typing import Any
 
 from moltrain import hostcheck, logs
 
+from . import grade as grading
 from . import harness, prompts, repair, runner
 from .config import ConfigError, load_config, resolve
 from .triage import assess_all, discover, write_report
@@ -363,6 +366,58 @@ async def _cmd_prompts(cfg: dict[str, Any], args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_grade(cfg: dict[str, Any], args: argparse.Namespace) -> int:
+    """Score one or more model replies against the rubric they were given."""
+    source = Path(args.source) if args.source else (
+        resolve(cfg, cfg["report"]["output_dir"]) / cfg["report"]["samples_csv"]
+    )
+    if not source.is_file():
+        print(f"no samples at {source}. Pass --source.", file=sys.stderr)
+        return 1
+
+    if args.reply_dir:
+        replies = sorted(Path(args.reply_dir).glob("*.txt"))
+    elif args.reply:
+        replies = [Path(args.reply)]
+    else:
+        print("pass --reply FILE or --reply-dir DIR", file=sys.stderr)
+        return 2
+    if not replies:
+        print("no reply files found", file=sys.stderr)
+        return 1
+
+    reports: list[grading.Report] = []
+    for path in replies:
+        # The task id comes from --task, or from the filename, which is how
+        # `prompts` names the task files the reply answers.
+        task_id = args.task or path.stem
+        baseline = grading.load_baseline(source, task_id)
+        if baseline is None:
+            print(
+                f"! {path.name}: no sample {task_id} in {source}; name the "
+                "file <target>-<sample>.txt or pass --task",
+                file=sys.stderr,
+            )
+            continue
+        report = grading.grade(baseline, path.read_text(encoding="utf-8",
+                                                        errors="replace"))
+        reports.append(report)
+        print(grading.format_report(report, verbose=args.verbose))
+
+    if not reports:
+        return 1
+    if len(reports) > 1:
+        counts: dict[str, int] = {}
+        for report in reports:
+            counts[report.verdict] = counts.get(report.verdict, 0) + 1
+        print(f"graded {len(reports)} reply(ies)")
+        for verdict in sorted(counts, key=lambda v: -counts[v]):
+            print(f"  {counts[verdict]:>6}  {verdict}")
+    if args.json:
+        print(json.dumps([r.as_dict() for r in reports], indent=2))
+    return 0 if all(r.verdict == "pass" for r in reports) else 1
+
+
 COMMANDS = {
     "probe": _cmd_probe,
     "prompts": _cmd_prompts,
@@ -370,6 +425,7 @@ COMMANDS = {
     "sample": _cmd_sample,
     "assess": _cmd_assess,
     "repair": _cmd_repair,
+    "grade": _cmd_grade,
 }
 
 
@@ -386,6 +442,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--source", default=None, help="read samples from this CSV instead"
+    )
+    parser.add_argument("--reply", default=None, help="grade: one reply file")
+    parser.add_argument(
+        "--reply-dir", default=None,
+        help="grade: a directory of <target>-<sample>.txt replies",
+    )
+    parser.add_argument(
+        "--task", default=None,
+        help="grade: the task id, when the filename does not carry it",
     )
     parser.add_argument("--json", action="store_true", help="also dump JSON")
     logs.add_cli_flags(parser)

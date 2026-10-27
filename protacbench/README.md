@@ -28,9 +28,38 @@ python -m protacbench plan     # the exact Pro-GAT argv, without running it
 python -m protacbench sample   # Pro-GAT sampling + repair  (GPU)
 python -m protacbench assess   # measure, rank, triage, write the CSVs
 python -m protacbench repair   # LLM repair of the rejects  (model endpoint)
+python -m protacbench prompts  # paste-ready tasks, one file per molecule
+python -m protacbench grade    # score replies against the rubric they got
 ```
 
-All five take `--verbose`, `--quiet`, `--no-progress`, `--log-file`, `--limit`.
+All of them take `--verbose`, `--quiet`, `--no-progress`, `--log-file`,
+`--limit`.
+
+`prompts` and `grade` are the two ends of a hand-run loop, for when you are
+driving a model yourself rather than through the endpoint:
+
+```bash
+python -m protacbench grade --reply-dir replies/ --verbose
+```
+
+Name each reply `<target>-<sample>.txt`, the way `prompts` names its tasks, or
+pass `--task`. The scorecard splits into **chemistry** — is the molecule a good
+PROTAC — and **protocol** — did the reply say so truthfully, in the form it was
+asked for. The two fail independently, and that is the point: a sound molecule
+in a reply with no `REPAIRED:` line is a harness bug, while a parseable answer
+whose cLogP climbed 1.1 is the model. `repair.verify` scores both of those the
+same, so `grade` measures three things it cannot:
+
+- **regression against the input**, not just the absolute limits. Every
+  descriptor can get substantially worse while still passing its threshold,
+  which is exactly what a repair that deletes a heteroatom to make a reactive
+  group disappear looks like.
+- **liabilities no tool on the server tests for**, such as an aminal ring.
+  `check_protac_linker` returns `ok` on those, so a model that only satisfies
+  the checker would otherwise score like one that did the chemistry.
+- **whether the reply's numbers are true**, and whether it stated the ones it
+  broke. A value matching the input rather than the answer is recorded as an
+  echo, not a lie, since replies routinely quote the task back.
 
 First time on a new host, fetch the models:
 
