@@ -1337,16 +1337,39 @@ def _adc_query(smarts: str) -> Chem.Mol:
 
 
 def _resolve_handle(handle: str) -> tuple[str, str, str]:
-    """A handle name or a raw SMARTS, as (name, smarts, what it conjugates to)."""
-    key = (handle or "").strip().lower()
+    """A handle name or a raw SMARTS, as (name, smarts, what it conjugates to).
+
+    A name that is not in the table is an error, never a SMARTS. The two are
+    not safely distinguishable by parsing, because plain words parse: every
+    letter of "banana" is a valid aromatic atom symbol, so a typo for a
+    handle name compiled into a nonsense query and came back as "no custom
+    handle is present" -- which reads like a fact about the molecule rather
+    than a typo in the call.
+
+    So anything that looks like a word has to BE a known name, and only a
+    string carrying SMARTS punctuation is tried as a pattern.
+    """
+    text = (handle or "").strip()
+    key = text.lower()
     if key in ADC_HANDLES:
         smarts, target = ADC_HANDLES[key]
         return key, smarts, target
-    if Chem.MolFromSmarts(handle) is not None:
-        return "custom", handle, "whatever you designed it for"
+
+    if text and all(character.isalnum() or character == "_" for character in text):
+        near = [name for name in ADC_HANDLES if name.startswith(key[:3])]
+        raise ToolError(
+            f"unknown handle {handle!r}. Known handles: "
+            f"{', '.join(sorted(ADC_HANDLES))}."
+            + (f" Did you mean {' or '.join(near)}?" if near else "")
+            + " To pass a pattern instead, give a SMARTS for the reactive "
+            "core."
+        )
+
+    if text and Chem.MolFromSmarts(text) is not None:
+        return "custom", text, "whatever you designed it for"
     raise ToolError(
-        f"unknown handle {handle!r}: give one of {sorted(ADC_HANDLES)} or a "
-        "valid SMARTS for the reactive core"
+        f"handle {handle!r} is neither a known handle name nor a valid "
+        f"SMARTS. Known handles: {', '.join(sorted(ADC_HANDLES))}."
     )
 
 

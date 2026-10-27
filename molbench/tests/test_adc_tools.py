@@ -302,6 +302,69 @@ def test_two_handles_are_rejected():
     assert any("crosslink" in issue for issue in result.data["issues"])
 
 
+def test_a_mistyped_handle_name_is_an_error_not_a_silent_smarts():
+    """Plain words parse as SMARTS -- every letter of "banana" is a valid
+    aromatic atom symbol -- so a typo compiled into a nonsense query and came
+    back as "no handle is present", which reads like a fact about the
+    molecule rather than a mistake in the call."""
+    smiles = _conjugate("*NCCOCCOCC*")
+    for typo in ("banana", "maleimde", "maleimid"):
+        result = call(
+            "check_adc_linker", {"smiles": smiles, "payload": MMAE, "handle": typo}
+        )
+        assert result.is_error, typo
+    # A real SMARTS still works, and so does a real name.
+    assert not call(
+        "check_adc_linker",
+        {"smiles": smiles, "payload": MMAE, "handle": "O=C1C=CC(=O)N1"},
+    ).is_error
+    assert not call(
+        "check_adc_linker",
+        {"smiles": smiles, "payload": MMAE, "handle": "maleimide"},
+    ).is_error
+
+
+def test_a_benzylamine_payload_linkage_is_caught():
+    """A payload hung on the p-aminobenzyl spacer as an amine rather than
+    through a carbamate will not leave: the carbamate is there because it
+    fragments to carbon dioxide plus the free amine."""
+    from adclinker import warheads as wh
+
+    cassette = (
+        "[*:1]C(=O)N[C@@H](C(C)C)C(=O)N[C@@H](CCCNC(N)=O)C(=O)Nc1ccc(C[*:2])cc1"
+    )
+    joined = wh.join(
+        "O=C1C=CC(=O)N1CCCCCC(=O)[*:1]", cassette, left_map=1, right_map=1
+    )
+    smiles = wh.join(joined, wh.PAYLOADS["mmae"].smiles, left_map=2, right_map=1)
+    result = call("check_payload_release", {"smiles": smiles, "payload": MMAE})
+    assert result.data["ok"] is False
+    assert any("benzylamine" in issue for issue in result.data["issues"])
+
+
+def test_the_real_dxd_is_a_camptothecin():
+    """PAYLOADS['dxd'] was a placeholder with no camptothecin pharmacophore:
+    MW 330 against 493, four rings against six, and no
+    alpha-hydroxy-delta-lactone, which is the thing that traps topoisomerase
+    I. Anything designed around it was built on a molecule that cannot kill
+    a cell."""
+    from rdkit.Chem import Descriptors
+
+    from adclinker import warheads as wh
+
+    lactone = Chem.MolFromSmarts(
+        "[CX4;R]([OX2])([CH2][CH3])[CX3;R](=[OX1])[OX2;R][CH2;R]"
+    )
+    for name in ("dxd", "exatecan"):
+        mol = Chem.MolFromSmiles(wh.PAYLOADS[name].smiles.replace("[*:1]", "[H]"))
+        assert mol is not None, name
+        assert mol.HasSubstructMatch(lactone), f"{name} lost its lactone"
+        assert mol.GetRingInfo().NumRings() >= 6, name
+    assert Descriptors.MolWt(
+        Chem.MolFromSmiles(wh.PAYLOADS["dxd"].smiles.replace("[*:1]", "[H]"))
+    ) == pytest.approx(493.5, abs=1.0)
+
+
 def test_an_unusable_payload_query_raises_rather_than_blaming_the_molecule():
     result = call(
         "check_adc_linker", {"smiles": _conjugate("*NCCOCC*"), "payload": "not a smiles"}
