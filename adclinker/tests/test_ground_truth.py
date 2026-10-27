@@ -62,10 +62,27 @@ def profile(tmp_path_factory) -> reference.Profile:
     )
 
 
-def _context(drug: dict, profile: reference.Profile) -> score.Context:
+@pytest.fixture(scope="module")
+def fingerprints() -> list:
+    """The real similarity reference, not an empty list.
+
+    Scoring with no fingerprints zeroes `adc_likeness` and maxes `novelty`
+    for every molecule, which shifts the whole scale by nine to fifteen
+    points. A test asserting anything about absolute scores against that is
+    measuring its own fixture rather than the scorer.
+    """
+    dataset = Path(__file__).resolve().parents[2] / "Linker-GPT/data/linkers.csv"
+    if not dataset.is_file():
+        pytest.skip(f"reference dataset not present at {dataset}")
+    return reference.fingerprint_reference(dataset)
+
+
+def _context(
+    drug: dict, profile: reference.Profile, fingerprints: list | None = None
+) -> score.Context:
     return score.Context(
         profile=profile,
-        reference_fingerprints=[],
+        reference_fingerprints=fingerprints or [],
         payload_smiles=drug["payload_smiles"],
         handle_smarts=chemistry.ADC_HANDLES[drug["handle"]][0],
         require_cleavable=drug["cleavable"],
@@ -91,7 +108,7 @@ def test_no_gate_rejects_an_approved_adc(approved, profile):
     )
 
 
-def test_approved_adcs_score_above_a_greasy_chain(approved, profile):
+def test_approved_adcs_score_above_a_greasy_chain(approved, profile, fingerprints):
     """Calibration, not just survival.
 
     Surviving the gates is not enough: the score has to rank real chemistry
@@ -99,18 +116,77 @@ def test_approved_adcs_score_above_a_greasy_chain(approved, profile):
     happened -- every term pinned at the same value, so the ranking was
     noise and a C18 chain came out level with the clinical spacer.
     """
+    from adclinker import warheads as wh
+
     totals = [
-        score.score_smiles(d["drug_linker_smiles"], _context(d, profile)).total
+        score.score_smiles(
+            d["drug_linker_smiles"], _context(d, profile, fingerprints)
+        ).total
         for d in approved
     ]
     assert all(t is not None for t in totals)
     assert min(totals) > 50.0, (
         f"an approved ADC scored {min(totals):.1f}; the scale has drifted"
     )
-    # And the spread must be narrow enough that these read as one population.
     assert max(totals) - min(totals) < 50.0, (
         "approved ADCs span too wide a range to be ranked meaningfully "
         f"({min(totals):.1f} to {max(totals):.1f})"
+    )
+
+    # The comparison the name promises: a greasy alkyl spacer must land
+    # below every one of them, and by a margin that is not noise.
+    pair = wh.build_pair(
+        "maleimidocaproyl", "val_cit_pab", "mmae", "spacer_before_cassette"
+    )
+    greasy = score.score_smiles(
+        wh.assemble("*NCCCCCCCCCCCC*", pair),
+        score.Context(
+            profile=profile,
+            reference_fingerprints=fingerprints,
+            payload_smiles=wh.PAYLOADS["mmae"].smiles,
+            handle_smarts=chemistry.ADC_HANDLES["maleimide"][0],
+            require_cleavable=True,
+        ),
+    )
+    assert "clogp_too_high" in greasy.gates_failed, (
+        f"a C12 greasy spacer was not rejected; it scored {greasy.total} "
+        f"with gates {greasy.gates_failed}. Its linker cLogP is above the "
+        "ceiling, so the scorer and the molbench tool must agree that it is "
+        "not a candidate"
+    )
+
+
+def test_peg_length_is_not_ranked_by_an_artefact(profile, fingerprints):
+    """Choosing between PEG2 and PEG8 is a drug-to-antibody-ratio question,
+    and nothing here measures it -- so they should tie.
+
+    They did not. Every other term ties exactly across a PEG series, so the
+    synthesisability term alone decided the ranking, and RDKit's SA score
+    drifts upward with molecule size. The scorer was ranking PEG length by a
+    size artefact, and preferring the shortest spacer -- the opposite of the
+    usual remedy for a hydrophobic drug-linker.
+    """
+    from adclinker import warheads as wh
+
+    pair = wh.build_pair(
+        "maleimidocaproyl", "val_cit_pab", "mmae", "spacer_before_cassette"
+    )
+    context = score.Context(
+        profile=profile,
+        reference_fingerprints=fingerprints,
+        payload_smiles=wh.PAYLOADS["mmae"].smiles,
+        handle_smarts=chemistry.ADC_HANDLES["maleimide"][0],
+        require_cleavable=True,
+    )
+    totals = []
+    for length in (2, 4, 6, 8):
+        spacer = "*N" + "CCO" * length + "CC*"
+        result = score.score_smiles(wh.assemble(spacer, pair), context)
+        assert result.total is not None, (length, result.gates_failed)
+        totals.append(result.total)
+    assert max(totals) - min(totals) < 1.0, (
+        f"PEG lengths 2 to 8 score {min(totals):.1f} to {max(totals):.1f}; "
+        "something is ranking them that should not be"
     )
 
 

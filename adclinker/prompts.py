@@ -39,21 +39,19 @@ from typing import Any
 # reagents, which is what `reference.build_profile` measures. Kept here as
 # literals so a prompt is reproducible without reading the dataset, and
 # checked against the live profile by the test suite so the two cannot drift.
-LINKER_BANDS: dict[str, tuple[float, float, float]] = {
-    "clogp": (-0.81, 0.68, 3.14),
-    "tpsa": (66.4, 139.3, 284.8),
-    "heavy_atoms": (16.0, 36.0, 85.0),
-    "mw": (242.3, 526.1, 1236.5),
-    "rotatable_bonds": (9.0, 25.0, 73.0),
-    "fsp3": (0.50, 0.88, 1.00),
-}
+LINKER_BANDS: dict[str, tuple[float, float, float]] = {'clogp': (-0.85, 0.53, 2.71),
+ 'tpsa': (66.4, 139.21, 284.33),
+ 'heavy_atoms': (15.0, 35.0, 84.0),
+ 'mw': (236.31, 511.57, 1213.46),
+ 'rotatable_bonds': (9.0, 24.0, 72.0),
+ 'fsp3': (0.54, 0.89, 1.0)}
 
 # The one hard ceiling, and the only property here with a monotone
 # relationship to outcome rather than a band. A more hydrophobic drug-linker
 # aggregates and is cleared faster, with no lower bound at which being polar
 # starts to hurt -- the linker is discarded on release and never has to cross
 # a membrane. Set at the reference set's own 90th percentile.
-CLOGP_CEILING = 3.14
+CLOGP_CEILING = 3.0
 
 # What to do about each rejection, specifically. Generic advice produces
 # generic edits.
@@ -186,28 +184,18 @@ it is cut, and the payload stays attached to the leftover amino acid. That
 design looks perfect in every descriptor and does nothing, and
 check_payload_release is the only thing here that sees it.
 
-LIMITS ON THE LINKER, NOT ON THE CONJUGATE. Every number below was measured
-on 1,692 real ADC linker reagents, which carry no payload. check_adc_linker
-excises the payload before measuring, and so must you -- quoting the whole
+LIMITS ON THE LINKER, NOT ON THE CONJUGATE. Every number below is measured
+on real ADC linker reagents, which carry no payload. check_adc_linker excises
+the payload before measuring, and so must you -- quoting the whole
 conjugate's cLogP against these is comparing different things, and every
 conjugate breaches every limit whatever its spacer.
 
-  HARD CEILING, not a target:
-    - linker cLogP at or below 3.14   (real-linker median 0.68)
-      This is the one limit with a monotone relationship to outcome. More
-      hydrophobic means more aggregation and faster clearance, and there is
-      no point at which being more polar starts to hurt.
-
-  BANDS that real linkers sit inside, worth noticing when you leave one:
-    - TPSA            66 to 285      (median 139)
-    - heavy atoms     16 to 85       (median 36)
-    - molecular mass  242 to 1237    (median 526)
-    - rotatable bonds 9 to 73        (median 25)
-    - Fsp3            0.50 to 1.00   (median 0.88)
+__LIMITS__
 
   Those bands are wide on purpose: they are the 10th to 90th percentile of
   real reagents, not a target to hit. A linker outside one is worth a look,
-  not an automatic failure. The cLogP ceiling is the one to respect.
+  not an automatic failure. The cLogP ceiling is the one to respect, and it
+  is set just above the most lipophilic linker in any approved ADC.
 
 TOOLS available to you:
 
@@ -293,6 +281,46 @@ molecule that scores well by cheating.
 """
 
 
+def _limits_block() -> str:
+    """The limits paragraph, generated from the tables rather than typed.
+
+    Written out by hand this drifted immediately: the thresholds were
+    recalibrated and the prose kept quoting the superseded numbers at the
+    agent, which is the same failure that had protacbench's per-task prompt
+    contradicting its own system prompt. Generated, it cannot.
+    """
+    # Rounded for reading, not for arithmetic. A band quoted to two decimal
+    # places invites an agent to treat it as a target.
+    labels = {
+        "tpsa": ("TPSA", 0),
+        "heavy_atoms": ("heavy atoms", 0),
+        "mw": ("molecular mass", 0),
+        "rotatable_bonds": ("rotatable bonds", 0),
+        "fsp3": ("Fsp3", 2),
+    }
+    clogp = LINKER_BANDS["clogp"]
+    lines = [
+        "  HARD CEILING, not a target:",
+        f"    - linker cLogP at or below {CLOGP_CEILING:.1f}"
+        f"      (real-linker median {clogp[1]:.2f})",
+        "      This is the one limit with a monotone relationship to outcome.",
+        "      More hydrophobic means more aggregation and faster clearance,",
+        "      and there is no point at which being more polar starts to hurt.",
+        "",
+        "  BANDS that real linkers sit inside, worth noticing when you leave one:",
+    ]
+    for key, (label, places) in labels.items():
+        low, median, high = LINKER_BANDS[key]
+        span = f"{low:.{places}f} to {high:.{places}f}"
+        lines.append(
+            f"    - {label:<16}{span:<18}(median {median:.{places}f})"
+        )
+    return "\n".join(lines)
+
+
+SYSTEM_PROMPT = SYSTEM_PROMPT.replace("__LIMITS__", _limits_block())
+
+
 ROW_TEMPLATE = """\
 Repair an ADC drug-linker: {handle} + {cassette} + {payload_name}.
 
@@ -360,6 +388,8 @@ def classify_row(row: dict[str, Any]) -> str:
         return "release"
     if gates & {"handle_lost", "handle_duplicated"}:
         return "handle"
+    if "clogp_too_high" in gates:
+        return "greasy"
     if gates & {"reactive_group", "disconnected", "unparseable"}:
         return "structural"
     if gates:

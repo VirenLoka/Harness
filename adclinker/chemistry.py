@@ -21,27 +21,37 @@ two lists that fell out of step.
 from __future__ import annotations
 
 # (p10, median, p90) across 1,692 payload-free reference reagents.
-ADC_LINKER_WINDOWS = {'clogp': (-0.81, 0.68, 3.14),
- 'tpsa': (66.4, 139.3, 284.8),
- 'heavy_atoms': (16.0, 36.0, 85.0),
- 'mw': (242.3, 526.1, 1236.5),
- 'rotatable_bonds': (9.0, 25.0, 73.0),
- 'fsp3': (0.5, 0.88, 1.0),
- 'hbd': (0.0, 1.0, 4.0),
- 'hba': (5.0, 10.0, 26.0)}
+ADC_LINKER_WINDOWS = {'heavy_atoms': (15.0, 35.0, 84.0),
+ 'mw': (236.31, 511.57, 1213.46),
+ 'clogp': (-0.85, 0.53, 2.71),
+ 'tpsa': (66.4, 139.21, 284.33),
+ 'rotatable_bonds': (9.0, 24.0, 72.0),
+ 'hbd': (0.0, 2.0, 4.0),
+ 'hba': (5.0, 10.0, 25.0),
+ 'fsp3': (0.54, 0.89, 1.0)}
 
 # The one monotone limit rather than a band, and the only hard threshold
-# here. Two independent derivations agree on it: it is the 90th percentile of
-# the 1,692 reference reagents, and it sits just above 2.87, the most
-# lipophilic linker among the 16 approved ADCs (Mylotarg and Besponsa's
-# hydrazone-disulfide). It rejects none of them.
+# here.
+#
+# 3.0 comes from the clinical evidence, not from the reference distribution,
+# and those two used to agree. Before the synthesis-only filters were
+# completed the reference p90 was 3.14, just above 2.87 -- the most
+# lipophilic linker among the 16 approved ADCs, Mylotarg and Besponsa's
+# hydrazone-disulfide -- so the number was justified twice over. Cleaning
+# the filters removed 177 greasy protected reagents and pulled the p90 down
+# to 2.71, which is BELOW that clinical maximum. Setting the ceiling there
+# would reject two marketed drugs.
+#
+# So it is pinned just above the most lipophilic thing anyone has actually
+# had approved, and the reference p90 no longer defines it. A distribution
+# over catalogue reagents is weaker evidence than a drug that cleared a
+# regulator.
 #
 # One-sided on purpose. Hydrophobicity is monotone -- a greasier drug-linker
 # aggregates more and clears faster, and there is no point at which being
 # more polar starts to hurt, because the linker is discarded on release and
-# never crosses a membrane. Enhertu's linker measures -1.71, below the
-# reference band entirely, and is approved.
-LINKER_CLOGP_CEILING = 3.14
+# never crosses a membrane. Enhertu's linker measures -1.71 and is approved.
+LINKER_CLOGP_CEILING = 3.0
 
 # Which of the windows above are worth saying anything about, and which are
 # measured but never judged.

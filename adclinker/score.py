@@ -115,6 +115,11 @@ GATES: dict[str, str] = {
     ),
     "handle_lost": "no reactive handle, so it cannot be conjugated",
     "handle_duplicated": "more than one reactive handle, which would crosslink",
+    "clogp_too_high": (
+        "the linker is greasier than any in the reference set and greasier "
+        "than any approved ADC's; hydrophobic drug-linkers aggregate and are "
+        "cleared quickly in vivo"
+    ),
     "too_small": (
         "the linker is shorter than any in the reference set, which holds "
         "the cassette flat against the antibody where no protease can reach it"
@@ -246,6 +251,11 @@ def _payload_query(payload_smiles: str) -> Any:
     mol leaves a radical that will not match a filled valence, and an
     explicit `[H]` survives as a heavy query atom that matches nothing.
     Without them a perfectly correct conjugate reports its payload missing.
+
+    This is the query that finds WHERE the payload is. Use
+    `_payload_stereo_query` to decide whether it is the right stereoisomer:
+    deleting the attachment dummy drops that atom to three neighbours, and a
+    three-neighbour query atom constrains no chirality at all.
     """
     from rdkit import Chem
 
@@ -271,6 +281,40 @@ def _payload_query(payload_smiles: str) -> Any:
     except Exception:  # noqa: BLE001 - an unsanitisable query still matches
         pass
     return query
+
+
+def _payload_stereo_query(payload_smiles: str) -> tuple[Any, set[int]]:
+    """The payload as a query that keeps its attachment point as a wildcard.
+
+    Returns the query and the indices within it that came from dummies, so
+    the caller can drop those from the match -- they land on linker atoms,
+    not payload ones.
+
+    **Why the dummy has to stay.** A stereocentre is defined by four
+    substituents. Delete the attachment dummy and the atom it was bonded to
+    has three, and RDKit will match either configuration there because there
+    is nothing left to distinguish them. For a payload that attaches at a
+    stereogenic carbon -- `exatecan` does -- that made `payload_altered`
+    blind at exactly the atom the linker touches, which is the atom most
+    likely to be damaged.
+
+    `makeDummiesQueries` turns the dummy into "any atom" instead, so the
+    centre keeps its fourth substituent and its configuration is checked
+    against whatever the linker put there.
+    """
+    from rdkit import Chem
+
+    mol = Chem.MolFromSmiles(payload_smiles)
+    if mol is None:  # unsanitisable: fall back to the position-only query
+        return _payload_query(payload_smiles), set()
+
+    dummies = {a.GetIdx() for a in mol.GetAtoms() if a.GetAtomicNum() == 0}
+    if not dummies:
+        return mol, set()
+
+    parameters = Chem.AdjustQueryParameters()
+    parameters.makeDummiesQueries = True
+    return Chem.AdjustQueryProperties(mol, parameters), dummies
 
 
 _QUERY_CACHE: dict[str, Any] = {}
@@ -416,7 +460,17 @@ def check_gates(mol: Any, context: Context, score: ADCScore) -> None:
                 )
             else:
                 score.payload_atoms = list(flat_match)
-                if not mol.GetSubstructMatch(query, useChirality=True):
+                # Stereochemistry is checked with the attachment point kept
+                # as a wildcard, so a centre at the attachment atom still has
+                # four substituents to be judged by. Checking with the
+                # dummy-deleted query instead is blind there -- see
+                # `_payload_stereo_query`.
+                stereo_query, _dummies = _payload_stereo_query(
+                    context.payload_smiles
+                )
+                if stereo_query is not None and not mol.GetSubstructMatch(
+                    stereo_query, useChirality=True
+                ):
                     score.gates_failed.append("payload_altered")
                     score.gate_detail = score.gate_detail or (
                         "the payload is present but at least one stereocentre "
@@ -623,6 +677,27 @@ def score_molecule(mol: Any, context: Context) -> ADCScore:
         # Say so rather than silently reverting to the broken comparison.
         score.scored_on = "conjugate (payload could not be excised)"
 
+    # The cLogP ceiling is a GATE here, not only a weighted term, so that
+    # this module and molbench's check_adc_linker reach the same verdict.
+    # They have to: this one decides what becomes a repair task and that one
+    # decides whether a repair is accepted, and a candidate the scorer ranks
+    # while the tool rejects sends an agent chasing a target that moves
+    # between the task and the grade.
+    #
+    # Safe against the ground truth: the most lipophilic linker among the 16
+    # approved ADCs is 2.87, below the ceiling of 3.0.
+    ceiling_value = score.linker_properties.get("clogp", properties["clogp"])
+    if ceiling_value > chemistry.LINKER_CLOGP_CEILING:
+        score.gates_failed.append("clogp_too_high")
+        score.gate_detail = score.gate_detail or (
+            f"the linker's cLogP is {ceiling_value}, above the ceiling of "
+            f"{chemistry.LINKER_CLOGP_CEILING}"
+        )
+        score.reason = "rejected: " + "; ".join(
+            GATES.get(code, code) for code in score.gates_failed
+        )
+        return score
+
     profile = context.profile
     terms: list[Term] = []
     # Everything from here down is measured on `judged` -- the linker alone
@@ -724,11 +799,24 @@ def score_molecule(mol: Any, context: Context) -> ADCScore:
         )
     )
 
+    # Full credit up to 4.8, which is just above 4.72 -- the hardest linker
+    # among the 16 approved ADCs (Trodelvy's) -- and just above the reference
+    # set's own p90 of 4.56.
+    #
+    # The ramp used to start at 3.0, which put 12 of those 16 on the
+    # penalised slope. That mattered more than it sounds: across a PEG
+    # series every other term ties exactly, so this term alone decided the
+    # ranking, and RDKit's SA score drifts upward with molecule size. The
+    # scorer was therefore ranking PEG length by a size artefact and
+    # preferring the shortest spacer, which is the opposite of the usual
+    # remedy for a hydrophobic drug-linker. Now they tie, which is honest:
+    # choosing between PEG2 and PEG8 is a drug-to-antibody-ratio question,
+    # and nothing here measures it.
     sa = _sa_score(judged)
     terms.append(
         Term(
             "synthesisability",
-            0.5 if sa is None else _ramp(sa, good=3.0, bad=7.0),
+            0.5 if sa is None else _ramp(sa, good=4.8, bad=7.5),
             WEIGHTS["synthesisability"][0],
             "SA could not be computed" if sa is None else f"SA {sa:.2f}",
         )

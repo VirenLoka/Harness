@@ -350,15 +350,26 @@ def test_an_unparseable_candidate_is_rejected_not_crashed(dataset):
     assert "unparseable" in result.gates_failed
 
 
-def test_a_greasy_linker_scores_below_a_polar_one(dataset):
-    """Polarity carries the most weight, because hydrophobicity is what kills
-    ADCs in vivo."""
+def test_a_greasy_linker_is_rejected_where_a_polar_one_is_not(dataset):
+    """Hydrophobicity is what kills ADCs in vivo, so it is a ceiling rather
+    than a weight to trade against.
+
+    It used to be only a weighted term here while molbench's
+    check_adc_linker treated it as a hard failure. The two have to agree:
+    this module decides what becomes a repair task and that tool decides
+    whether a repair is accepted, so a candidate one ranks and the other
+    rejects sends an agent chasing a target that moves between the task and
+    the grade.
+    """
     context = make_context(dataset)
     polar = "O=C1C=CC(=O)N1CCOCCOCCC(=O)N[C@@H](CCCNC(N)=O)C(=O)Nc1ccc(CO)cc1"
     greasy = "O=C1C=CC(=O)N1CCCCCCCCCCCCCCCC(=O)N[C@@H](CCCNC(N)=O)C(=O)Nc1ccc(CO)cc1"
-    assert score.score_smiles(polar, context).total > score.score_smiles(
-        greasy, context
-    ).total
+
+    accepted = score.score_smiles(polar, context)
+    rejected = score.score_smiles(greasy, context)
+    assert accepted.total is not None
+    assert "clogp_too_high" in rejected.gates_failed, rejected.gates_failed
+    assert rejected.total is None
 
 
 def test_reward_is_bounded_and_zero_for_rejects(dataset):

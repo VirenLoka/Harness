@@ -3,26 +3,60 @@
 # Pass this file to the harness as an overlay:
 #   npx @deepseek-ai/dsh@0.2.0-rc.2 web --patch /Users/virenloka/Boot/harness/molbench/molbench.cordis.yml
 #
-# One entry is enough: the plugin mounts its own @deepseek-ai/dsh-mcp-client
-# connection to the Python server, so the four RDKit tools arrive as
-# mcp__molbench__<tool> alongside the plugin's own benchmark_transformation.
+# Two entries, because the connection and the plugin want different things.
+#
+# `mcp-molbench` owns the stdio connection to the Python server. Every tool
+# server.py registers arrives as mcp__molbench__<tool>: the RDKit and docking
+# tools, and the PROTAC/ADC checkers (check_protac_linker, check_adc_linker,
+# check_payload_release) that adclinker and protacbench prompt against. The
+# client is the only place `failOnStartupError` and `toolCallTimeoutMs` are
+# read, which is why it is a separate entry -- the plugin's own config schema
+# has neither, so setting them there is silently ignored.
+#
+# `molbench` is the plugin, mounted with `connect: false` so it reuses the
+# connection above instead of opening a second one under the same serverName.
+# It adds `benchmark_transformation` on top of the server's tools.
 #
 # `name` is the absolute path of the built plugin, so nothing has to be
 # installed into the harness. Run `npm run build` in plugin/ first. If you
 # prefer installing it as a package there instead
 # (`npm install /Users/virenloka/Boot/harness/molbench/plugin`), use
 # `name: molbench-harness-plugin`.
+#
+# NOTE: mounting the tools does not tell the agent they exist. `dsh web` sends
+# no system prompt, so a hand-pasted task reaches a model that has the tools in
+# its list and no instruction to use them. Paste the matching system prompt as
+# the first message of the session -- see prompts/README.md next to this file --
+# or drive the run through `python -m protacbench repair`, which sends it.
 
 - insert:
-    - id: molbench
-      name: /Users/virenloka/Boot/harness/molbench/plugin/lib/index.js
+    - id: mcp-molbench
+      name: '@deepseek-ai/dsh-mcp-client'
       config:
-        # Namespace for the Python tools: mcp__molbench__get_molecule_metrics, etc.
-        server: molbench
+        serverName: molbench
+        transport: stdio
         # The project virtualenv, so RDKit and FastMCP are importable.
         command: /Users/virenloka/Boot/harness/molbench/.venv/bin/python
         args: ['/Users/virenloka/Boot/harness/molbench/server.py']
         cwd: /Users/virenloka/Boot/harness/molbench
+        # A dead MCP server is silently absent by default, which shows up as an
+        # agent that "chose" not to measure anything rather than as an error.
+        # Fail loudly instead. protacbench/harness.py sets this for the same
+        # reason.
+        failOnStartupError: true
+        # Conformer generation and docking are the slow ones; 60s is what the
+        # headless repair runs use.
+        toolCallTimeoutMs: 60000
+
+    - id: molbench
+      name: /Users/virenloka/Boot/harness/molbench/plugin/lib/index.js
+      config:
+        # Namespace for the Python tools: mcp__molbench__get_molecule_metrics,
+        # mcp__molbench__check_protac_linker, and the rest.
+        server: molbench
+        # The entry above already holds the connection. Opening a second one
+        # under the same serverName collides.
+        connect: false
         # Products scored per transformation.
         maxProducts: 3
         # Attach 2D depictions to benchmark results by default.
@@ -32,23 +66,3 @@
         # Receptor dock_and_score falls back to when a call names none. Produce
         # one first with prepare_target_receptor, then paste its path here:
         # defaultReceptor: /Users/virenloka/Boot/harness/molbench/receptors/3PTB_BEN.pdbqt
-
-# Alternative: let a standalone MCP client entry own the connection, for
-# example to set reconnect or timeout policy. Then the plugin must not open a
-# second connection under the same serverName.
-#
-# - insert:
-#     - id: molbench-server
-#       name: '@deepseek-ai/dsh-mcp-client'
-#       config:
-#         serverName: molbench
-#         transport: stdio
-#         command: /Users/virenloka/Boot/harness/molbench/.venv/bin/python
-#         args: ['/Users/virenloka/Boot/harness/molbench/server.py']
-#         cwd: /Users/virenloka/Boot/harness/molbench
-#         toolCallTimeoutMs: 60000
-#     - id: molbench
-#       name: molbench-harness-plugin
-#       config:
-#         server: molbench
-#         connect: false

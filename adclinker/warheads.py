@@ -215,7 +215,7 @@ PAYLOADS: dict[str, Payload] = {
     "exatecan": Payload(
         "exatecan",
         "CC[C@@]1(O)C(=O)OCc2c1cc1n(c2=O)Cc2c-1nc1cc(F)c(C)c3c1c2"
-        "[C@@H]([*:1])CC3",
+        "[C@@H](N[*:1])CC3",
         "the C1 primary amine",
         "Exatecan itself, attached through its amine rather than through a "
         "glycolamide. Use when you want the spacer to carry the whole "

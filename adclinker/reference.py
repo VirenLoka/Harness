@@ -54,7 +54,30 @@ SYNTHESIS_ONLY_GROUPS: tuple[tuple[str, str], ...] = (
     ("nhs_ester", "O=C(ON1C(=O)CCC1=O)"),
     ("alloc", "O=C(OCC=C)N"),
     ("tbu_ester", "O=C(OC(C)(C)C)[#6]"),
+    # The six above were the original set and missed roughly 180 molecules
+    # that carry a bench-only group of another kind. Each of the following
+    # was checked both ways before being added: how many reference reagents
+    # it excludes, and whether it fires anywhere in the linker of the 16
+    # approved ADCs. One that fires on a marketed drug is not a protecting
+    # group, it is a mis-specified pattern.
+    ("pfp_ester", "O=C(Oc1c(F)c(F)c(F)c(F)c1F)"),
+    ("tfp_ester", "O=C(Oc1c(F)c(F)cc(F)c1F)"),
+    ("benzyl_ester", "O=C(OCc1ccccc1)[#6]"),
+    ("trityl", "[CX4](c1ccccc1)(c1ccccc1)c1ccccc1"),
+    ("methyl_ester", "O=C(O[CH3])[#6]"),
+    ("silyl", "[Si]"),
 )
+
+# Deliberately NOT in the list above, and worth recording so it is not added
+# back: **Cbz**, `O=C(OCc1ccccc1)N`.
+#
+# A benzyloxycarbonyl protecting group and a p-aminobenzyl carbamate are the
+# same substructure. That SMARTS fires on seven approved ADCs -- Adcetris,
+# Polivy, Padcev, Tivdak, Aidixi, Zynlonta and Emrelis -- because the PABC
+# self-immolative spacer IS a benzyl carbamate. Excluding it would drop the
+# single most common cleavable architecture in the field from the profile
+# that every threshold is measured against.
+CBZ_IS_INDISTINGUISHABLE_FROM_PAB = "O=C(OCc1ccccc1)N"
 
 # Motifs that make a linker cleavable in the lysosome. Presence is a gate in
 # `score.py`, not a scored term: a linker that never releases its payload is
@@ -134,12 +157,21 @@ class Profile:
     def as_dict(self) -> dict[str, Any]:
         return {
             "source": self.source,
+            "filters": _filter_fingerprint(),
             "n_total": self.n_total,
             "n_unique": self.n_unique,
             "n_profiled": self.n_profiled,
             "n_cleavable": self.n_cleavable,
             "properties": {k: v.as_dict() for k, v in self.properties.items()},
         }
+
+
+def _filter_fingerprint() -> str:
+    """A short digest of the filter set, stored in the cache."""
+    import hashlib
+
+    joined = "|".join(f"{name}:{smarts}" for name, smarts in SYNTHESIS_ONLY_GROUPS)
+    return hashlib.sha256(joined.encode()).hexdigest()[:16]
 
 
 def _percentiles(values: list[float]) -> Percentiles:
@@ -312,7 +344,20 @@ def load_profile(
         # profile -- and every threshold downstream then describes a dataset
         # that is not the one configured.
         stored = raw.get("source", "")
-        if stored and stored != str(Path(dataset).resolve()):
+        # The filter set is fingerprinted into the cache. Adding a
+        # protecting group changes which molecules are profiled and
+        # therefore every percentile, but it does not change the dataset
+        # path -- so without this a stale profile outlives the change that
+        # invalidated it, and the thresholds describe a filtering that is no
+        # longer applied.
+        if raw.get("filters") != _filter_fingerprint():
+            warnings.warn(
+                f"cached profile at {cache_path} was built with a different "
+                "set of synthesis-only filters; rebuilding",
+                stacklevel=2,
+            )
+            raw = None
+        elif stored and stored != str(Path(dataset).resolve()):
             warnings.warn(
                 f"cached profile at {cache_path} was built from {stored}, "
                 f"not {Path(dataset).resolve()}; rebuilding",
