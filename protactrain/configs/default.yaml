@@ -1,0 +1,277 @@
+# protactrain: GRPO training for PROTAC linker optimisation.
+#
+# Sibling to moltrain, which does the same for DiffSBDD pocket tasks. The
+# generic machinery (ATEM parsing, the completion mask, TRL compatibility,
+# batched generation) is imported from moltrain rather than copied; the
+# measurement layer is imported from protacbench. What lives here is the task,
+# the reward and the training shape.
+#
+# Stage order: build tasks -> collect traces -> SFT warmup -> GRPO -> evaluate.
+
+molbench:
+  path: ../molbench
+
+protacbench:
+  path: ../protacbench
+
+episode:
+  max_turns: 8
+  max_tool_calls: 24
+  # The six tools OPTIMISATION.md names as useful for a linker task.
+  # check_protac_linker is the one that decides acceptance, and the policy
+  # gets it deliberately: the repair corpus this package is built from was
+  # produced with it in the prompt, so withholding it would make the RL
+  # episodes incomparable to their own baseline. Grinding against it is
+  # priced, not forbidden -- see turn_penalty_free_calls.
+  #
+  # The docking tools are absent on purpose. A PROTAC binds two proteins at
+  # once and is decided by the ternary complex; docking scores one ligand into
+  # one rigid receptor. At ~26 rotatable bonds the conformational search is
+  # past where it stays reliable, and the score would be dominated by the
+  # warhead -- the part the policy is forbidden to touch and whose affinity is
+  # already known.
+  tools:
+    - check_protac_linker
+    - benchmark_transformation
+    - validate_smiles
+    - get_molecule_metrics
+    - render_molecule_2d
+    - generate_3d_conformer
+  tool_timeout_s: 300.0
+  max_tool_result_chars: 4000
+  reasoning_strength: high
+
+reward:
+  # Every threshold is a band: `low`, `high`, or both. A term scores by how
+  # far outside its band the value sits, and that distance is what the episode
+  # is paid to close. One-sided targets simply leave the other side null.
+  #
+  # Which band a value started in decides what the term IS. Outside at the
+  # start -> a goal, paying shaped progress for the distance closed. Inside at
+  # the start -> a hold, earning nothing and charged only if the episode
+  # pushes it out. Nothing is ever paid for leaving a satisfied target alone.
+  #
+  # The numbers are the two regimes already in this repo, not new ones.
+  # `low`/`high` are OPTIMISATION.md's p25-p75 bands, measured from the clean
+  # passing samples of a real 1024-sample run and sanity-checked against 128
+  # published PROTACs. `tolerance` is the slack before a hold is charged, and
+  # the hard limits it defends are grade.py's grader contract (SPAN_TARGET
+  # 8-17 with SPAN_FLOOR 7, MAX_SA 6.0, MAX_CLOGP 7.5, MIN_TPSA 120,
+  # MAX_ROTATABLE 30).
+  thresholds:
+    # Span is first because it is the only one that can make the molecule not
+    # a PROTAC. Below 7 bonds the two warheads cannot occupy their binding
+    # sites at once, whatever every other descriptor says.
+    span:
+      low: 8
+      high: 13
+      tolerance: 4        # out to grade.py's 17; the floor of 7 is a hard gate
+    linker_heavy_atoms:
+      low: 8
+      high: 14
+      tolerance: 11       # out to the 5-25 hard range
+    sa_score:
+      low: null
+      high: 4.9
+      tolerance: 1.1      # out to MAX_SA 6.0
+    clogp:
+      low: 3.5
+      high: 5.6
+      tolerance: 1.9      # out to MAX_CLOGP 7.5
+    tpsa:
+      low: 170.0
+      high: 217.0
+      tolerance: 50.0     # down to MIN_TPSA 120
+    rotatable_bonds:
+      low: 13
+      high: 18
+      tolerance: 12       # out to MAX_ROTATABLE 30
+    mw:
+      low: 780.0
+      high: 940.0
+      tolerance: 660.0    # out to the 400-1600 hard range
+
+    # QED is deliberately absent, not forgotten. The 128 published PROTACs
+    # this corpus is built from have a median QED of 0.064 and 34% fall below
+    # 0.05; 0.10 would reject 73% of them. QED scores oral-small-molecule
+    # likeness, so on a ~940 Da bifunctional degrader it measures how unlike a
+    # PROTAC the molecule is. Rewarding it would rank the worst candidates
+    # highest, which is also why protacbench's own score.py excludes it.
+    #
+    # This is why 952 of the 2,229 tasks whose ONLY recorded failure is
+    # `qed_too_low` are kept as control episodes: under this reward they have
+    # genuinely nothing to fix, and what the policy does with them measures
+    # whether it can correctly do very little.
+
+  # Descriptor drift charged regardless of band, from grade.REGRESSION_TOLERANCE.
+  # A molecule can sit inside every band and still have been walked in the
+  # wrong direction the whole way.
+  regression_tolerance:
+    clogp: 0.15
+    tpsa: 2.0
+    sa_score: 0.15
+    rotatable_bonds: 2
+
+  # Linker length is set by ternary-complex geometry, not preference.
+  # grade.LENGTH_TOLERANCE: two heavy atoms is about one bond of span.
+  length_tolerance: 2
+
+  weights:
+    # --- chemistry: what the molecule became
+    thresholds: 1.0
+    all_met_bonus: 0.5
+    hold_violation: 0.4
+    regression: 0.4
+    synthesis_score: 0.3    # protacbench.score.score_sample, as a dense 0-100 signal
+
+    # --- protocol: how the policy worked
+    #
+    # These exist because an outcome-only reward teaches tool use only by
+    # accident. If a molecule can be improved by guessing, guessing scores as
+    # well as measuring, and GRPO will find that out. protacbench's grade
+    # scorecard already splits chemistry from protocol and fails them
+    # independently; these are that second half, as reward.
+    #
+    # `grounding` is the load-bearing one and the only term that can go
+    # negative on its own: it is +1 when every number the reply stated came
+    # back from a tool and -1 when none did. A model stating measurements it
+    # never made is the worst habit this training could instil, and an
+    # outcome reward is completely blind to it -- the molecule is unaffected
+    # by what was said about it. Weighted at 0.5 it can overturn a mediocre
+    # chemistry result, which is the intent.
+    grounding: 0.5
+    # measure, change one thing, re-measure. Three parts, scored separately.
+    discipline: 0.3
+    # called check_protac_linker before submitting
+    verification: 0.15
+
+    # --- cost of working
+    tool_success: 0.2
+    turn_penalty: 0.005
+  # Measuring is the task, not waste. moltrain found that a flat 0.02/call
+  # penalty made its expert's sixteen honest calls cost 0.32 and erased the
+  # 0.116 of progress they bought, so the reward's optimum was to submit
+  # blind. The free allowance is what stops that, and it matters more here:
+  # the protocol terms above actively ask for more calls.
+  turn_penalty_free_calls: 10
+  violation_cap: 3.0
+
+  # Inadmissible, not merely poor. A deleted warhead improves SA, cLogP, TPSA,
+  # rotatable bonds and MW at once, so this has to be a floor rather than a
+  # weighted term: a term can be outweighed, a floor cannot.
+  inadmissible_reward: -1.0
+  no_submission_reward: -1.0
+
+  property_cache_path: cache/linker_properties.jsonl
+
+dataset:
+  # protacbench's repair_tasks.jsonl, which already carries per-task
+  # fragment_smiles, linker{} and properties{} -- exactly the measured
+  # baseline a relative reward needs.
+  source: repair_tasks
+  repair_tasks: ../repair_tasks.jsonl
+  tasks_file: data/tasks.jsonl
+  # Pro-GAT repair is strictly upstream and never a tool: the rollout path
+  # stays pure-CPU RDKit, with no second GPU model inside the training step.
+  # Only the `generated` stage is used -- the RL policy IS the repair step.
+  stages: [generated]
+  verdicts: [poor, broken]
+  # task_id in repair_tasks.jsonl is '{target}-{sample}-{stage}'. The trailing
+  # '-generated' is stripped, because GRPO rewrites ids to '{id}@{generation}'
+  # and traces to '{id}#{attempt}', and a third suffix makes group membership
+  # ambiguous -- which silently destroys advantages rather than failing.
+  strip_stage_suffix: true
+  offset: 0
+  limit: null
+  shuffle_seed: 42
+  # Keep the qed-only tasks as controls rather than dropping them.
+  include_controls: true
+
+model:
+  name: meta-models/Muse-Glimmer-30B
+  max_prompt_tokens: 24576
+  max_completion_tokens: 2048
+
+sft:
+  output_dir: runs/sft
+  traces_file: data/sft_traces.jsonl
+  # Calibrate against the scripted linker expert before trusting this number;
+  # moltrain's 0.45 was set against its own expert's measured spread and does
+  # not transfer.
+  min_reward: null
+  require_submission: true
+  require_improvement: true
+  learning_rate: 1.0e-5
+  num_train_epochs: 2
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  max_seq_length: 8192
+  bf16: true
+  gradient_checkpointing: true
+  lora:
+    r: 32
+    alpha: 64
+    dropout: 0.05
+
+grpo:
+  output_dir: runs/grpo
+  learning_rate: 1.0e-6
+  num_generations: 8
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  max_steps: 500
+  beta: 0.02
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 64
+
+  # TWO H200s, ONE ENGINE EACH.
+  #
+  # moltrain sets TRL's use_vllm True *and* starts its own vllm.LLM inside
+  # rollout_func (grpo.py:144, grpo.py:206), so one process holds two engines.
+  # Under DDP that is four engines on two GPUs and neither fits.
+  #
+  # TRL's rollout_func is the documented place to do your own generation, so
+  # TRL's internal engine is dead weight the moment one is supplied. Turning
+  # it off leaves exactly one engine per rank.
+  use_trl_vllm: false
+  vllm_gpu_memory_utilization: 0.35
+  # Rank-gate the engine and the asyncio loop: both must be per-process, and
+  # moltrain's `asyncio.run()` inside the training step is not rank-safe as
+  # written.
+  engine_per_rank: true
+
+  ddp:
+    enabled: true
+    world_size: 2
+    launcher: torchrun       # torchrun | accelerate
+    find_unused_parameters: false
+
+  lora:
+    r: 32
+    alpha: 64
+    dropout: 0.05
+  resume_from_sft: true
+
+evaluate:
+  output_dir: runs/eval
+  # OPTIMISATION.md's four arms. `unchanged` is the floor any arm must clear,
+  # and it is a real floor here: with the fragments frozen, most descriptors
+  # barely move.
+  arms: [unchanged, one_shot, policy, policy_best_of_3]
+  attempts: 3
+  # Stratify, because the three classes fail in different ways and will not
+  # have the same yield: reactive (one group swap, local) is expected high,
+  # structural moderate, chemistry low. A near-zero chemistry yield is a
+  # finding -- those molecules need resampling, not harder optimisation.
+  stratify_by: optimisation_class
+  min_per_class: 50
+  separate_cache: true
+  property_cache_path: cache/linker_properties_eval.jsonl
+
+run:
+  seed: 42
+  log_dir: runs/logs
+  log_level: INFO
+  log_to_file: true
+  progress: auto

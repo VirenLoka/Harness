@@ -1,0 +1,95 @@
+# protactrain -- the training environment for PROTAC linker GRPO.
+#
+# This is the first training environment committed to this repository that is
+# meant to be re-solved on another machine. The three that came before it
+# (DiffLinker/environment.yml, Pro-GAT/diffprotac.yml, DiffSBDD/environment.yaml)
+# are exact-build linux-64 exports -- `python=3.10.18=h1a3bd86_0`,
+# `torch-scatter==2.1.2+pt28cu128` -- which pin a build string to one solver
+# run on one host and fail to resolve anywhere else. They are kept as a record
+# of what those upstream repos were run with, not as something to install
+# from. This file uses loose pins on purpose.
+#
+# WHY THIS IS A SEPARATE ENVIRONMENT, and cannot be folded into an existing one:
+#
+#   DiffSBDD   pins pytorch=2.0.1 *cuda11.8* with pytorch-lightning 1.8.4
+#   Pro-GAT    pins torch==2.8.0 with torch-scatter/sparse/cluster built
+#              against pt28cu128
+#   REINVENT4  pins torch==2.12.0 against the cu126 wheel index
+#
+# Three mutually exclusive torch builds, and none of them is the one vLLM
+# 0.29 wants. A single environment is not possible, and trying to make one
+# silently downgrades torch under whichever package was installed first.
+# protactrain never imports any of those three: Pro-GAT is strictly upstream
+# of this package (it produced repair_tasks.jsonl and is never a tool), and
+# there is no docking here, so no DiffSBDD and no DiffLinker.
+#
+# WHAT IS DELIBERATELY ABSENT: openbabel, vina, smina, meeko, gemmi. moltrain
+# needs all of them because its reward docks. This package does not dock at
+# all -- see README.md and protacbench/OPTIMISATION.md:161 -- so the rollout
+# path is pure-CPU RDKit and the docking stack is dead weight that also drags
+# in its own numpy and boost pins.
+#
+# Create it with:
+#   conda env create -f protactrain/environment.yml
+#   conda activate protactrain
+#
+# or, faster and solving the same file:
+#   mamba env create -f protactrain/environment.yml
+name: protactrain
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+
+dependencies:
+  # 3.12 because the package is written against it (PEP 604 unions, the 3.12
+  # typing syntax in every module). vLLM 0.29 supports 3.9-3.12.
+  - python=3.12
+
+  # CUDA 12.x: the H200 is sm_90 and needs a cu12 build. 11.8 does not know
+  # Hopper's FP8 path at all, which is why DiffSBDD's environment cannot be
+  # reused here even ignoring the version conflict.
+  - pytorch>=2.6
+  - pytorch-cuda=12.*
+
+  - transformers>=4.48
+  - trl>=0.14          # GRPOTrainer with rollout_func and completion_mask
+  - peft>=0.13         # LoRA on a frozen base; full FT of 30B does not fit
+  - accelerate>=1.0
+  - datasets>=3.0
+  - bitsandbytes>=0.44 # 4-bit base so the adapter and vLLM share the card
+
+  # The whole measurement path. protactrain.properties, protacbench.grade and
+  # protacbench.structures are RDKit from end to end, and the rollout runs
+  # them on CPU inside the training step.
+  - rdkit>=2025.3
+  - numpy
+  - scipy
+
+  - pyyaml             # every stage is driven by configs/default.yaml
+  - tqdm               # progress bars; moltrain.progress degrades without it
+  - pytest>=8
+
+  - pip
+  - pip:
+      # The tools are imported out of molbench/server.py as plain Python
+      # functions -- no MCP, no Node -- but that module imports fastmcp and
+      # pydantic at module scope to declare them, so both are needed even
+      # though no server is ever started. This is the same surface the model
+      # is deployed against, which is the point of importing it rather than
+      # re-declaring it.
+      - fastmcp>=4.0,<5
+      - pydantic>=2
+
+      # Muse Glimmer needs vLLM 0.29.0 or newer -- its reasoning parser, its
+      # tool parser and the DFlash drafter all landed in 0.29. See
+      # ../README.md, which serves the same model.
+      #
+      # vLLM pins an exact torch build. If the H200 container already ships a
+      # vLLM built for its own CUDA and torch, keep that one and do not let
+      # this line replace it:
+      #   python -c 'import vllm; print(vllm.__version__)'
+      # scripts/setup_remote.sh checks for exactly that case before creating
+      # anything.
+      - vllm>=0.29.0
