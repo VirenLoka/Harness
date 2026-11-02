@@ -71,7 +71,6 @@ adclinker/runs/
 # it just never matched these because of where they landed.
 /repair_batch_*.csv
 /repair_master*.csv
-/repair_tasks.jsonl
 /repair_summary.md
 /final_*.csv
 /progress_report_*.md
