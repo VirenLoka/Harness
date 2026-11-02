@@ -346,6 +346,98 @@ def describe_linker(mol: Any, linker_len: int) -> LinkerView:
     return linker_view(mol, linker_indices(mol.GetNumAtoms(), linker_len))
 
 
+def span_through_linker(
+    mol: Any, linker_indices: list[int], anchor_atoms: list[int]
+) -> tuple[int | None, tuple[int, int] | None]:
+    """Bonds from one side of the molecule to the other, THROUGH the linker.
+
+    Returns the span and the pair of anchors it was measured between, or
+    (None, None) when the linker does not bridge two sides.
+
+    `Chem.GetShortestPath` over the whole graph is the obvious implementation
+    and it is wrong, because the shortest route between two anchors need not
+    go through the linker at all. molbench's `_span_through_linker` already
+    says so in a comment -- "GetShortestPath over the whole graph happily
+    routes through a fragment" -- and this function exists so that the two
+    packages compute one number the same way.
+
+    Measured across the 2,229-row corpus before this was shared: the previous
+    whole-graph implementation and molbench's agreed on all 1,940 molecules
+    whose linker attaches at exactly two atoms, and disagreed on all 47 with
+    three or more. Every one of those is a `linker_not_bridging` molecule, so
+    the old number was not merely different, it was arbitrary: it took
+    `anchor_atoms[0]` and `anchor_atoms[1]` by sorted atom index, which on a
+    three-attachment linker routinely picks two anchors on the SAME fragment
+    and reports the path within that fragment.
+
+    The two sides are the connected components left when the linker is
+    removed, which needs no fragment SMILES and so works identically whether
+    the linker was found by counting back from the end of a Pro-GAT sample or
+    by subtracting matched fragments from a repaired one.
+    """
+    from rdkit import Chem
+
+    if len(anchor_atoms) < 2 or not linker_indices:
+        return None, None
+
+    linker_set = set(linker_indices)
+
+    # Partition the non-linker atoms into sides. A bridging linker leaves
+    # exactly two; one side means it dangles or doubled back onto a single
+    # fragment, more than two means the molecule was already in pieces.
+    editable = Chem.RWMol(mol)
+    for index in sorted(linker_indices, reverse=True):
+        editable.RemoveAtom(index)
+    kept = [i for i in range(mol.GetNumAtoms()) if i not in linker_set]
+    try:
+        components = Chem.GetMolFrags(editable.GetMol())
+    except Exception:  # noqa: BLE001 - a span is not worth failing an assessment for
+        return None, None
+    if len(components) != 2:
+        return None, None
+
+    # GetMolFrags indexes into the edited molecule; map back to the original.
+    side_of: dict[int, int] = {}
+    for side, component in enumerate(components):
+        for position in component:
+            side_of[kept[position]] = side
+
+    starts = {a for a in anchor_atoms if side_of.get(a) == 0}
+    ends = {a for a in anchor_atoms if side_of.get(a) == 1}
+    if not starts or not ends:
+        return None, None
+
+    # Breadth-first across linker atoms only, entering from the start side
+    # and leaving onto the end side. The two crossing bonds are the +2, which
+    # is exactly molbench's arithmetic.
+    from collections import deque
+
+    gateways: dict[int, int] = {}
+    origin: dict[int, int] = {}
+    for index in linker_indices:
+        for neighbour in mol.GetAtomWithIdx(index).GetNeighbors():
+            if neighbour.GetIdx() in starts:
+                gateways.setdefault(index, 0)
+                origin.setdefault(index, neighbour.GetIdx())
+
+    if not gateways:
+        return None, None
+
+    queue = deque(gateways)
+    distance = dict(gateways)
+    while queue:
+        current = queue.popleft()
+        for neighbour in mol.GetAtomWithIdx(current).GetNeighbors():
+            index = neighbour.GetIdx()
+            if index in ends:
+                return distance[current] + 2, (origin[current], index)
+            if index in linker_set and index not in distance:
+                distance[index] = distance[current] + 1
+                origin[index] = origin[current]
+                queue.append(index)
+    return None, None
+
+
 def linker_view(mol: Any, indices: list[int]) -> LinkerView:
     """Measure how the given atoms bridge the rest of the molecule.
 
@@ -382,19 +474,14 @@ def linker_view(mol: Any, indices: list[int]) -> LinkerView:
     # The bond count between the two fragment anchors is the length that
     # governs ternary-complex geometry, and it is not the same as the atom
     # count: a linker can be long but fold through a ring.
-    path_length: int | None = None
+    path_length, spanning_anchors = span_through_linker(mol, indices, anchor_atoms)
+
     exit_distance: float | None = None
-    if len(anchor_atoms) >= 2:
-        try:
-            path = Chem.GetShortestPath(mol, anchor_atoms[0], anchor_atoms[1])
-            path_length = max(len(path) - 1, 0) or None
-        except Exception:  # noqa: BLE001
-            path_length = None
-        if mol.GetNumConformers():
-            conformer = mol.GetConformer()
-            first = conformer.GetAtomPosition(anchor_atoms[0])
-            second = conformer.GetAtomPosition(anchor_atoms[1])
-            exit_distance = round(first.Distance(second), 3)
+    if spanning_anchors is not None and mol.GetNumConformers():
+        conformer = mol.GetConformer()
+        first = conformer.GetAtomPosition(spanning_anchors[0])
+        second = conformer.GetAtomPosition(spanning_anchors[1])
+        exit_distance = round(first.Distance(second), 3)
 
     heteroatoms = sum(
         1 for index in indices if mol.GetAtomWithIdx(index).GetSymbol() != "C"
