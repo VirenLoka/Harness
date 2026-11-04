@@ -728,13 +728,25 @@ def check(cfg: dict[str, Any]) -> int:
     # A container caps how many tasks it may hold, and every thread counts.
     # Over the cap, OpenMP cannot create its pool and the rank segfaults with
     # no usable traceback -- see limits.py.
+    ranks_planned = wanted_world if bool(ddp.get("enabled")) else 1
     print("\nthreads")
-    thread_lines, thread_problems = limits.report_threads(
-        wanted_world if bool(ddp.get("enabled")) else 1
-    )
+    thread_lines, thread_problems = limits.report_threads(ranks_planned)
     for line in thread_lines:
         print(line)
     problems.extend(thread_problems)
+
+    # ------------------------------------------------------------ free memory
+    #
+    # `report_cuda` above prints each card's TOTAL memory, which says nothing
+    # about whether a run can start: the H200s are shared, and a card with
+    # 139.8 GB total and 200 MiB free reads identically there. Measured on the
+    # box, five processes held the whole of device 1 and the OOM arrived only
+    # after the dataset had been tokenised.
+    print("\nfree device memory")
+    gpu_lines, gpu_problems = limits.report_gpus(ranks_planned)
+    for line in gpu_lines:
+        print(line)
+    problems.extend(gpu_problems)
 
     print("\ndistributed")
     print(f"  config: enabled={bool(ddp.get('enabled'))} world_size={wanted_world} "

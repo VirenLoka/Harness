@@ -90,3 +90,76 @@ def test_it_runs_on_this_host_whatever_this_host_is():
     lines, problems = limits.report_threads(2)
     assert lines and all(isinstance(line, str) for line in lines)
     assert all(isinstance(p, str) for p in problems)
+
+
+# ------------------------------------------------------------ free device VRAM
+
+
+def test_a_full_card_is_a_problem_even_though_its_total_looks_fine(monkeypatch):
+    """The exact shape of the measured failure.
+
+    nvidia-smi reported 139.8 GiB total and 0.2 free on device 1, with five
+    processes holding the rest. `report_cuda` shows only the total, so nothing
+    in `check` objected and the OOM arrived after the dataset was tokenised.
+    """
+    monkeypatch.setattr(
+        limits,
+        "gpu_memory",
+        lambda: [
+            {"index": 0, "total": 139.8, "used": 10.0, "free": 129.8},
+            {"index": 1, "total": 139.8, "used": 139.6, "free": 0.2},
+        ],
+    )
+    monkeypatch.setattr(
+        limits,
+        "compute_apps",
+        lambda: [
+            {"pid": 3605570, "gib": 67.5, "name": "python"},
+            {"pid": 3908006, "gib": 25.1, "name": "python"},
+        ],
+    )
+    lines, problems = limits.report_gpus(2)
+
+    assert any("device 1: 0.2 GiB free" in line for line in lines)
+    assert any("pid 3605570" in line for line in lines)
+    assert len(problems) == 1
+    assert "1 (0.2 GiB free)" in problems[0]
+    assert "WORLD_SIZE=1" in problems[0]
+
+
+def test_one_free_card_is_enough_for_one_rank(monkeypatch):
+    monkeypatch.setattr(
+        limits,
+        "gpu_memory",
+        lambda: [
+            {"index": 0, "total": 139.8, "used": 10.0, "free": 129.8},
+            {"index": 1, "total": 139.8, "used": 139.6, "free": 0.2},
+        ],
+    )
+    monkeypatch.setattr(limits, "compute_apps", lambda: [])
+    _lines, problems = limits.report_gpus(1)
+    assert problems == [], "the emptiest card is picked first"
+
+
+def test_no_nvidia_smi_reports_rather_than_guesses(monkeypatch):
+    monkeypatch.setattr(limits, "gpu_memory", lambda: [])
+    lines, problems = limits.report_gpus(2)
+    assert problems == []
+    assert any("nvidia-smi" in line for line in lines)
+
+
+def test_more_ranks_than_devices_is_caught(monkeypatch):
+    monkeypatch.setattr(
+        limits,
+        "gpu_memory",
+        lambda: [{"index": 0, "total": 139.8, "used": 1.0, "free": 138.8}],
+    )
+    monkeypatch.setattr(limits, "compute_apps", lambda: [])
+    _lines, problems = limits.report_gpus(2)
+    assert len(problems) == 1 and "1 device(s)" in problems[0]
+
+
+def test_the_gpu_probe_never_raises_on_this_host():
+    lines, problems = limits.report_gpus(2)
+    assert all(isinstance(line, str) for line in lines)
+    assert all(isinstance(p, str) for p in problems)

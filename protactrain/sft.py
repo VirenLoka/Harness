@@ -26,6 +26,7 @@ from typing import Any
 from moltrain import logs
 from moltrain.trl_compat import adapt, describe
 
+from . import limits
 from .config import ConfigError, load_config, log_destination, resolve
 from .policy import require_cuda
 
@@ -115,6 +116,20 @@ def check(cfg: dict[str, Any]) -> int:
     for line in cuda_lines:
         print(line)
     problems.extend(cuda_problems)
+
+    # `report_cuda` prints each card's total memory, which stays reassuring on
+    # a card that is already full. This stage is the one that OOMed on a shared
+    # H200, so it asks the question that decides whether a run can start.
+    ranks = int(cfg["grpo"].get("ddp", {}).get("world_size", 1) or 1)
+    print("\nthreads")
+    for line in (thread := limits.report_threads(ranks))[0]:
+        print(line)
+    problems.extend(thread[1])
+
+    print("\nfree device memory")
+    for line in (gpus := limits.report_gpus(ranks))[0]:
+        print(line)
+    problems.extend(gpus[1])
 
     if any(r.name == "trl" and r.ok for r in reports):
         try:

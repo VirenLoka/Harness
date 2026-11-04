@@ -56,4 +56,11 @@ for _name in (
 os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
+# Allocate in segments that can grow rather than in fixed blocks. A 30B model
+# plus checkpointed activations fragments the caching allocator badly, and the
+# OOM this package hit on a shared H200 reported 472 MiB "reserved but
+# unallocated" while failing to find 508. torch's own OOM message recommends
+# this setting by name. It is not a substitute for free memory on the card.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 __version__ = "0.1.0"
