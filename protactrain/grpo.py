@@ -132,6 +132,16 @@ def require_cuda(what: str) -> None:
     is written on there is nothing to load it into, and the failure mode
     without this check is a silent wait followed by an out-of-memory trace
     from inside vLLM.
+
+    `device_count()` and not `is_available()`, and the difference is not
+    cosmetic. `is_available()` falls through to `torch._C._cuda_getDeviceCount`,
+    which torch's own source describes as initialising "the CUDA Driver API via
+    cuInit"; that registers a `pthread_atfork` handler, and vLLM's forked
+    EngineCore then dies on its first CUDA call with "Cannot re-initialize CUDA
+    in forked subprocess". This gate runs immediately before every engine
+    start, so for as long as it called `is_available()` it was the thing
+    breaking the engine it was guarding. `device_count()` asks NVML first and
+    only falls back to the poisoning call if NVML is missing entirely.
     """
     try:
         import torch
@@ -141,11 +151,24 @@ def require_cuda(what: str) -> None:
             "This stage runs on the two-H200 box, not on a laptop."
         ) from exc
 
-    if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+    if torch.cuda.device_count() == 0:
         raise RuntimeError(
             f"{what} needs a visible CUDA device and torch can see none. "
             "Run `python -m protactrain.grpo check` on the training host."
         )
+
+
+def should_resume_from_sft(cfg: dict[str, Any]) -> tuple[Path, bool]:
+    """Where the SFT adapter is, and whether GRPO should continue from it.
+
+    A directory is not enough to go on: `sft.output_dir` exists as soon as
+    anything has written a log into it, and resuming from a directory with no
+    adapter in it fails inside peft rather than here. `adapter_config.json` is
+    what `save_pretrained` writes, so it is the honest test.
+    """
+    adapter = resolve(cfg, cfg["sft"]["output_dir"])
+    wanted = bool(cfg["grpo"]["resume_from_sft"])
+    return adapter, wanted and (adapter / "adapter_config.json").is_file()
 
 
 def load_engine(cfg: dict[str, Any], where: Ranks) -> Any:
@@ -666,6 +689,36 @@ def check(cfg: dict[str, Any]) -> int:
     # into this process -- which is the whole reason it runs in a subprocess.
     visible = sum(1 for line in cuda_lines if line.startswith("  device: "))
 
+    # ------------------------------------------------------------ fork safety
+    #
+    # vLLM forks its EngineCore child. A forked child may not touch CUDA if
+    # this process already holds a context, and the whole run dies on engine
+    # start with "Cannot re-initialize CUDA in forked subprocess" -- a long way
+    # from anything that names the real cause. `is_initialized()` only reads a
+    # flag; it never creates the context it is reporting on.
+    print("\nfork safety")
+    print(
+        "  VLLM_WORKER_MULTIPROC_METHOD="
+        f"{os.environ.get('VLLM_WORKER_MULTIPROC_METHOD', '<unset>')}  "
+        "PYTORCH_NVML_BASED_CUDA_CHECK="
+        f"{os.environ.get('PYTORCH_NVML_BASED_CUDA_CHECK', '<unset>')}"
+    )
+    try:
+        import torch
+
+        initialised = torch.cuda.is_initialized()
+    except Exception as exc:  # noqa: BLE001 - a probe never sinks the check
+        print(f"  could not probe torch: {type(exc).__name__}: {exc}")
+    else:
+        print(f"  CUDA already initialised in this process: {initialised}")
+        if initialised and os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
+            problems.append(
+                "this process already holds a CUDA context and vLLM would fork "
+                "its EngineCore, which cannot then touch CUDA. Set "
+                "VLLM_WORKER_MULTIPROC_METHOD=spawn (protactrain/__init__.py "
+                "does this by default, so an explicit value has overridden it)."
+            )
+
     print("\ndistributed")
     ddp = cfg["grpo"].get("ddp", {})
     wanted_world = int(ddp.get("world_size", 1))
@@ -913,16 +966,27 @@ def train(cfg: dict[str, Any], *, dry_run: bool = False) -> int:
     args = GRPOConfig(**settings)
     peft_config = LoraConfig(**lora_settings(cfg, "grpo"))
 
-    model = cfg["model"]["name"]
-    if cfg["grpo"]["resume_from_sft"] and where.is_main_process():
-        adapter = resolve(cfg, cfg["sft"]["output_dir"])
-        if adapter.is_dir():
-            print(f"starting from the SFT adapter at {adapter}")
-        else:
-            print(f"note: grpo.resume_from_sft is set but {adapter} does not exist")
+    model: Any = cfg["model"]["name"]
+
+    # Whether to resume is decided on EVERY rank, not just the main one. It
+    # used to be computed inside an `is_main_process()` block, which meant the
+    # answer was never even looked at on rank 1 -- and two ranks averaging
+    # gradients for two different models is a failure that shows up as a
+    # slightly odd loss curve and nothing else.
+    adapter, resume = should_resume_from_sft(cfg)
+    if cfg["grpo"]["resume_from_sft"] and not resume and where.is_main_process():
+        print(
+            f"note: grpo.resume_from_sft is set but {adapter} holds no "
+            "adapter_config.json, so GRPO starts from the base model and the "
+            "SFT warmup is not used"
+        )
 
     if where.is_main_process():
         print(f"model   : {model}")
+        print(
+            "start   : "
+            + (f"SFT adapter at {adapter}" if resume else "base model, fresh LoRA")
+        )
         print(f"tasks   : {len(tasks)}  x {args.num_generations} generations")
         print(f"steps   : {args.max_steps}")
         print(f"ranks   : {where.world_size}  (one vLLM engine each)")
@@ -932,6 +996,32 @@ def train(cfg: dict[str, Any], *, dry_run: bool = False) -> int:
         if where.is_main_process():
             print("dry run: not starting the trainer")
         return 0
+
+    if resume:
+        # Continue training the warmed-up adapter instead of stacking a second,
+        # randomly initialised one on top of it. `peft_config` has to become
+        # None here: handing GRPOTrainer both a PeftModel and a LoraConfig
+        # wraps the adapter in another adapter, and SFT's work is buried under
+        # a fresh layer rather than continued.
+        #
+        # Until this existed, `resume_from_sft: true` printed that it was
+        # starting from the adapter and then passed the bare model name to the
+        # trainer, so stage 2 was discarded in full every run.
+        from peft import PeftModel
+        from transformers import AutoModelForCausalLM
+
+        LOG.info("loading the SFT adapter from %s", adapter)
+        try:
+            base = AutoModelForCausalLM.from_pretrained(
+                cfg["model"]["name"], dtype="auto", trust_remote_code=True
+            )
+        except TypeError:
+            # transformers renamed `torch_dtype` to `dtype`; accept either.
+            base = AutoModelForCausalLM.from_pretrained(
+                cfg["model"]["name"], torch_dtype="auto", trust_remote_code=True
+            )
+        model = PeftModel.from_pretrained(base, str(adapter), is_trainable=True)
+        peft_config = None
 
     trainer = GRPOTrainer(
         model=model,

@@ -69,6 +69,10 @@ def require_cuda(what: str) -> None:
     the TRL probe -- into every evaluation run that uses the GPU-free
     `unchanged` arm. The check is four lines; the import is the whole training
     stack.
+
+    `device_count()` and not `is_available()`, for the reason spelled out in
+    `grpo.require_cuda`: `is_available()` initialises a CUDA context, and a
+    context in this process is what stops vLLM's forked EngineCore starting.
     """
     try:
         import torch
@@ -78,7 +82,7 @@ def require_cuda(what: str) -> None:
             "This stage runs on the two-H200 box, not on a laptop."
         ) from exc
 
-    if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+    if torch.cuda.device_count() == 0:
         raise RuntimeError(
             f"{what} needs a visible CUDA device and torch can see none. "
             "Run `python -m protactrain.grpo check` on the training host."

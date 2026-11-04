@@ -83,6 +83,21 @@ export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-$PROTACTRAIN_NUM_THREAD
 # step, so the quiet setting is the right one.
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
+# --------------------------------------------------------------- fork poisoning
+#
+# vLLM forks its EngineCore child by default, and a forked child cannot touch
+# CUDA once the parent has a context -- it dies with "Cannot re-initialize CUDA
+# in forked subprocess". `spawn` gives the child a clean interpreter, so
+# nothing the parent imported first can break it. `PYTORCH_NVML_BASED_CUDA_CHECK`
+# keeps `torch.cuda.is_available()` off the `cuInit` path that creates the
+# context in the first place.
+#
+# protactrain/__init__.py sets both, but that is too late for anything torchrun
+# loads before the package is imported, which is the same reason the thread
+# caps are repeated here.
+export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+export PYTORCH_NVML_BASED_CUDA_CHECK="${PYTORCH_NVML_BASED_CUDA_CHECK:-1}"
+
 # ------------------------------------------------------------------- ranks
 #
 # grpo.ddp.world_size in the config is 2 and so is the default here. WORLD_SIZE
