@@ -51,6 +51,7 @@ from typing import Any
 from moltrain import logs, progress
 from moltrain.grpo_core import build_batch, degenerate_groups
 
+from . import limits
 from .config import ConfigError, load_config, log_destination, resolve
 from .episode import Task, build_prompt, run_episode
 from .properties import LinkerProperties
@@ -719,9 +720,23 @@ def check(cfg: dict[str, Any]) -> int:
                 "does this by default, so an explicit value has overridden it)."
             )
 
-    print("\ndistributed")
     ddp = cfg["grpo"].get("ddp", {})
     wanted_world = int(ddp.get("world_size", 1))
+
+    # ---------------------------------------------------------------- threads
+    #
+    # A container caps how many tasks it may hold, and every thread counts.
+    # Over the cap, OpenMP cannot create its pool and the rank segfaults with
+    # no usable traceback -- see limits.py.
+    print("\nthreads")
+    thread_lines, thread_problems = limits.report_threads(
+        wanted_world if bool(ddp.get("enabled")) else 1
+    )
+    for line in thread_lines:
+        print(line)
+    problems.extend(thread_problems)
+
+    print("\ndistributed")
     print(f"  config: enabled={bool(ddp.get('enabled'))} world_size={wanted_world} "
           f"launcher={ddp.get('launcher', 'torchrun')}")
     print(f"  environment: RANK={where.rank} LOCAL_RANK={where.local_rank} "

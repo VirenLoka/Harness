@@ -71,12 +71,18 @@ done
 # demand -- so they are set here, before the launcher starts.
 #
 # An explicitly set variable always wins, matching the package's own default.
-export PROTACTRAIN_NUM_THREADS="${PROTACTRAIN_NUM_THREADS:-8}"
-export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-$PROTACTRAIN_NUM_THREADS}"
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$PROTACTRAIN_NUM_THREADS}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$PROTACTRAIN_NUM_THREADS}"
-export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-$PROTACTRAIN_NUM_THREADS}"
-export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-$PROTACTRAIN_NUM_THREADS}"
+#
+# This is a budget for the WHOLE job, divided across the ranks further down.
+# It used to be applied per rank, so `--nproc_per_node=2` asked for twice what
+# was intended and a two-rank SFT run died with
+#
+#   libgomp: Thread creation failed: Resource temporarily unavailable
+#   error: can't start new thread
+#   ... exitcode: -11 (SIGSEGV)
+#
+# EAGAIN from pthread_create, i.e. the container's task cap. The segfault is
+# libgomp failing to recover, not a separate fault worth chasing.
+THREAD_BUDGET="${PROTACTRAIN_NUM_THREADS:-8}"
 
 # Tokenizers forks a thread pool per worker and warns loudly once the data
 # collator forks; the fast tokenizer is not the bottleneck in a rollout-bound
@@ -114,6 +120,22 @@ esac
 # its launcher, so it is removed once it has been read.
 unset WORLD_SIZE
 
+# ------------------------------------------------------- threads, per rank
+#
+# Now that the rank count is known, divide the job's budget by it. Each rank
+# is a full copy of the stack with its own OpenMP pool, so two ranks at the
+# full budget ask the container for twice what one rank does -- against the
+# same cap.
+PER_RANK=$(( THREAD_BUDGET / NPROC ))
+[ "$PER_RANK" -ge 1 ] || PER_RANK=1
+
+export PROTACTRAIN_NUM_THREADS="$PER_RANK"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-$PER_RANK}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$PER_RANK}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$PER_RANK}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-$PER_RANK}"
+export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-$PER_RANK}"
+
 VISIBLE="unknown (nvidia-smi not on PATH)"
 if command -v nvidia-smi >/dev/null 2>&1; then
   VISIBLE="$(nvidia-smi --query-gpu=index,name --format=csv,noheader 2>/dev/null | paste -sd'; ' -)"
@@ -139,7 +161,8 @@ CMD+=("${EXTRA[@]+"${EXTRA[@]}"}")
 printf '\n==> protactrain %s on %s process(es)\n' "$STAGE" "$NPROC"
 printf '    root     %s\n' "$ROOT"
 printf '    config   %s\n' "$CONFIG"
-printf '    threads  %s\n' "$PROTACTRAIN_NUM_THREADS"
+printf '    threads  %s per rank (budget %s across %s)\n' \
+  "$PER_RANK" "$THREAD_BUDGET" "$NPROC"
 printf '    gpus     %s\n' "$VISIBLE"
 printf '    command  '
 # printf %q so the echoed line is one that can be pasted back into a shell
