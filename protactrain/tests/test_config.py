@@ -193,3 +193,33 @@ def test_a_rank_suffix_separates_the_two_ddp_log_files():
     one = Path(log_destination(cfg, args, "grpo-train", suffix="-rank1")).name
     assert zero.startswith("grpo-train-rank0-")
     assert one.startswith("grpo-train-rank1-")
+
+
+# ------------------------------------------------------- stopping SFT early
+
+
+def test_sft_max_steps_is_off_by_default_and_overrides_the_epochs():
+    """TRL spells "use the epochs" as -1, not as None.
+
+    This knob exists because the measured run did not need its epochs. On the
+    H200 box, token accuracy reached 0.997 and entropy fell to 0.009 at 7% of
+    epoch 1 -- the scripted traces are formulaic enough to be memorised almost
+    immediately. A policy that samples deterministically produces identical
+    rollouts in a GRPO group, the advantages are then all zero, and stage 3
+    learns nothing while looking entirely healthy.
+    """
+    from protactrain.config import load_config
+    from protactrain.sft import training_settings
+
+    cfg = load_config(None)
+    assert cfg["sft"]["max_steps"] is None
+    assert training_settings(cfg)["max_steps"] == -1
+
+    cfg["sft"]["max_steps"] = 150
+    assert training_settings(cfg)["max_steps"] == 150
+
+    # 0 and "" are "unset" too, so a half-edited config does not train for
+    # zero steps and report success.
+    for empty in (0, ""):
+        cfg["sft"]["max_steps"] = empty
+        assert training_settings(cfg)["max_steps"] == -1

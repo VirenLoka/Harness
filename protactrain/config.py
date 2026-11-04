@@ -228,6 +228,10 @@ DEFAULTS: dict[str, Any] = {
         "require_improvement": True,
         "learning_rate": 1e-5,
         "num_train_epochs": 2,
+        # null means "use the epochs". Set a step count instead when the
+        # traces are formulaic enough that the format is learned long before
+        # the epoch ends -- see sft.training_settings.
+        "max_steps": None,
         "per_device_train_batch_size": 1,
         "gradient_accumulation_steps": 8,
         "max_seq_length": 8192,

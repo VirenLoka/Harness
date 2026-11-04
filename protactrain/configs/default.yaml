@@ -203,6 +203,11 @@ sft:
   require_improvement: true
   learning_rate: 1.0e-5
   num_train_epochs: 2
+  # Overrides the epochs when set. Watch `entropy` in TRL's log: the scripted
+  # traces are formulaic, and once entropy approaches zero the policy samples
+  # the same rollout every time, which makes every GRPO group degenerate.
+  # Measured: entropy 0.009 and token accuracy 0.997 at 7% of epoch 1.
+  max_steps: null
   per_device_train_batch_size: 1
   gradient_accumulation_steps: 8
   max_seq_length: 8192

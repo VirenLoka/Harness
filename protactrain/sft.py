@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -39,10 +40,21 @@ TOOL_OUTPUT_MARKER = "<tool_output"
 
 def training_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     sft = cfg["sft"]
+    # -1 is how TrainingArguments spells "use the epoch count instead". A real
+    # number overrides it, and this stage wants one far more often than the
+    # epoch count suggests: the scripted traces are formulaic, so the format
+    # is learned in a few dozen steps and everything after that is the model
+    # memorising one expert. Measured on the H200 box, token accuracy reached
+    # 99.7% and entropy fell to 0.009 at 7% of the first epoch -- and a policy
+    # that samples deterministically makes every GRPO group degenerate, which
+    # is the one failure `grpo rollout` exists to catch before it costs 500
+    # steps.
+    raw_max = sft.get("max_steps")
     return {
         "output_dir": str(resolve(cfg, sft["output_dir"])),
         "learning_rate": float(sft["learning_rate"]),
         "num_train_epochs": float(sft["num_train_epochs"]),
+        "max_steps": -1 if raw_max in (None, "", 0) else int(raw_max),
         "per_device_train_batch_size": int(sft["per_device_train_batch_size"]),
         "gradient_accumulation_steps": int(sft["gradient_accumulation_steps"]),
         "max_seq_length": int(sft["max_seq_length"]),
@@ -200,8 +212,30 @@ def train(cfg: dict[str, Any], *, dry_run: bool = False) -> int:
     args = SFTConfig(**settings)
     peft_config = LoraConfig(**lora_settings(cfg, "sft"))
 
+    # How long this will actually run, said before it starts rather than
+    # inferred from a progress bar hours later. TRL truncates to
+    # max_seq_length and then drops anything whose completion was truncated
+    # away entirely, so the real count is a little lower than this one.
+    world = int(os.environ.get("WORLD_SIZE", "1") or 1)
+    effective = (
+        int(args.per_device_train_batch_size)
+        * int(args.gradient_accumulation_steps)
+        * world
+    )
+    planned = (
+        int(args.max_steps)
+        if int(args.max_steps) > 0
+        else -(-len(records) // effective) * int(float(args.num_train_epochs))
+    )
+
     print(f"model      : {cfg['model']['name']}")
     print(f"records    : {len(records)}")
+    print(
+        f"batch      : {effective} effective "
+        f"({args.per_device_train_batch_size} x {args.gradient_accumulation_steps} "
+        f"accumulation x {world} rank(s))"
+    )
+    print(f"steps      : ~{planned} before truncation drops anything")
     print(f"output_dir : {args.output_dir}")
     print(f"lora       : r={peft_config.r} alpha={peft_config.lora_alpha}")
     if dry_run:
