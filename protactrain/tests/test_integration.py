@@ -126,7 +126,13 @@ def test_run_episode_takes_the_arguments_its_four_callers_pass():
 
 def test_policy_exposes_the_factory_traces_and_evaluate_reach_for():
     assert callable(policy.vllm_factory)
-    assert list(inspect.signature(policy.vllm_factory).parameters) == ["cfg"]
+    parameters = inspect.signature(policy.vllm_factory).parameters
+    assert list(parameters) == ["cfg", "adapter"]
+    # Defaulting to None keeps `evaluate`'s GPU-free `unchanged` arm working,
+    # but the callers that sample a trained policy must pass one: an engine
+    # built without an adapter decodes from the base model, which has never
+    # seen the ATEM call format. See test_adapter.py.
+    assert parameters["adapter"].default is None
 
 
 def test_episode_result_attribute_names_are_the_ones_readers_use():

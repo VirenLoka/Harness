@@ -13,6 +13,12 @@ decode eight sequences one after another. `BatchingGenerator` collects the
 concurrent requests and issues them to vLLM as a single batch, which is what
 makes the group cost roughly one rollout's worth of decode instead of eight.
 
+**The adapter.** A trained policy is a LoRA adapter, and vLLM applies one only
+when a `LoRARequest` rides along with the call -- `enable_lora=True` on the
+engine reserves slots and nothing more. `VLLMEngine` carries the request so
+that every turn is decoded from the policy being trained rather than, silently,
+from the base weights.
+
 Everything is written against a tiny engine protocol (`generate(prompts,
 params) -> list of texts`), so the whole layer is testable with a fake engine
 and no GPU.
@@ -212,18 +218,61 @@ def build_sampling_params(cfg: dict[str, Any]) -> Any:
     )
 
 
-class VLLMEngine:
-    """Adapts vLLM's offline `LLM` to the `Engine` protocol."""
+def build_lora_request(path: Any, *, name: str = "policy", adapter_id: int = 1) -> Any:
+    """A vLLM `LoRARequest` for the adapter at `path`.
 
-    def __init__(self, llm: Any):
+    vLLM caches an adapter by its integer id, so swapping in newly trained
+    weights means a NEW id -- reusing one serves the previously cached tensors
+    and the engine goes on sampling the old policy.
+    """
+    from vllm.lora.request import LoRARequest
+
+    return LoRARequest(str(name), int(adapter_id), str(path))
+
+
+def lora_rank(cfg: dict[str, Any], default: int = 16) -> int:
+    """The largest LoRA rank this config can ask the engine to serve.
+
+    vLLM rejects an adapter whose rank exceeds `max_lora_rank`, and its own
+    default is 16 -- below the 32 these packages train with. Taking the max
+    across the sections means an engine started for one stage can still serve
+    the other stage's adapter.
+    """
+    ranks = [default]
+    for section in ("grpo", "sft"):
+        rank = (cfg.get(section) or {}).get("lora", {}).get("r")
+        if rank:
+            ranks.append(int(rank))
+    return max(ranks)
+
+
+class VLLMEngine:
+    """Adapts vLLM's offline `LLM` to the `Engine` protocol.
+
+    The adapter lives on the engine rather than being passed per call. It is a
+    property of the process -- every turn of every episode in a rollout is
+    sampled from the same policy -- and holding it here keeps `Policy` and
+    `BatchingGenerator` unaware of it, so neither has to grow a field it would
+    only ever forward.
+
+    `enable_lora=True` on the `LLM` is NOT enough to apply an adapter: it only
+    reserves the slots and kernels. Without a `lora_request` on the call, vLLM
+    decodes from the base weights, silently.
+    """
+
+    def __init__(self, llm: Any, lora_request: Any = None):
         self.llm = llm
+        self.lora_request = lora_request
 
     def generate(self, prompts: Sequence[str], params: Any) -> list[str]:
-        outputs = self.llm.generate(list(prompts), params)
+        # Omitted rather than passed as None, so a fake engine in a test (and
+        # any vLLM too old for the keyword) still sees the original signature.
+        extra = {} if self.lora_request is None else {"lora_request": self.lora_request}
+        outputs = self.llm.generate(list(prompts), params, **extra)
         return [output.outputs[0].text for output in outputs]
 
 
-def load_engine(cfg: dict[str, Any]) -> VLLMEngine:
+def load_engine(cfg: dict[str, Any], adapter: Any = None) -> VLLMEngine:
     """Start vLLM in this process, sharing the GPU with the trainer."""
     from vllm import LLM
 
@@ -234,9 +283,10 @@ def load_engine(cfg: dict[str, Any]) -> VLLMEngine:
         max_model_len=int(cfg["model"]["max_prompt_tokens"])
         + int(cfg["model"]["max_completion_tokens"]),
         enable_lora=True,
+        max_lora_rank=lora_rank(cfg),
         trust_remote_code=True,
     )
-    return VLLMEngine(llm)
+    return VLLMEngine(llm, build_lora_request(adapter) if adapter else None)
 
 
 def build_policy(
@@ -259,9 +309,9 @@ def build_policy(
     )
 
 
-def vllm_factory(cfg: dict[str, Any]) -> Callable[[Task], Policy]:
+def vllm_factory(cfg: dict[str, Any], adapter: Any = None) -> Callable[[Task], Policy]:
     """One shared engine and batcher across every task in a run."""
-    engine = load_engine(cfg)
+    engine = load_engine(cfg, adapter)
     params = build_sampling_params(cfg)
     policy = build_policy(cfg, engine, params)
 

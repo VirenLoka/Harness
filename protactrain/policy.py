@@ -89,23 +89,32 @@ def require_cuda(what: str) -> None:
         )
 
 
-def load_engine(cfg: dict[str, Any]) -> VLLMEngine:
+def load_engine(cfg: dict[str, Any], adapter: Any = None) -> VLLMEngine:
     """Start one vLLM engine in this process.
 
     No rank handling, unlike `grpo.load_engine`: the callers here are
     single-process. A distributed run that reached this function would put two
     engines on device 0, which is the exact trap `grpo.py` exists to avoid, so
     it is better that this one stays obviously non-distributed.
+
+    `adapter` defaults to None because this loader's callers are not all the
+    same: `evaluate`'s `one_shot` arm wants the base model by definition,
+    while its `policy` arm and the model-sourced trace collection want the
+    trained one. The caller says which; passing nothing means the base model
+    and is a choice, not a default to fall into.
     """
     require_cuda("starting a vLLM engine")
 
     from vllm import LLM
 
+    from moltrain.policy import build_lora_request, lora_rank
+
     grpo = cfg["grpo"]
     LOG.info(
-        "starting vLLM on %s at %.2f memory utilisation",
+        "starting vLLM on %s at %.2f memory utilisation, sampling from %s",
         cfg["model"]["name"],
         float(grpo["vllm_gpu_memory_utilization"]),
+        adapter if adapter else "the base model (no adapter)",
     )
     return VLLMEngine(
         LLM(
@@ -114,12 +123,15 @@ def load_engine(cfg: dict[str, Any]) -> VLLMEngine:
             max_model_len=int(cfg["model"]["max_prompt_tokens"])
             + int(cfg["model"]["max_completion_tokens"]),
             enable_lora=True,
+            # r=32 here against vLLM's default ceiling of 16.
+            max_lora_rank=lora_rank(cfg),
             trust_remote_code=True,
-        )
+        ),
+        build_lora_request(adapter) if adapter else None,
     )
 
 
-def vllm_factory(cfg: dict[str, Any]) -> Callable[[Task], Policy]:
+def vllm_factory(cfg: dict[str, Any], adapter: Any = None) -> Callable[[Task], Policy]:
     """One shared engine and batcher across every task in a run.
 
     The batcher is shared on purpose. Each episode asks for one turn at a
@@ -128,7 +140,7 @@ def vllm_factory(cfg: dict[str, Any]) -> Callable[[Task], Policy]:
     A per-task batcher would never see more than one request and would be
     the serial case with extra bookkeeping.
     """
-    engine = load_engine(cfg)
+    engine = load_engine(cfg, adapter)
     params = build_sampling_params(cfg)
     policy = build_policy(cfg, engine, params)
 

@@ -41,6 +41,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import shutil
 import statistics
 import sys
 import time
@@ -52,7 +53,13 @@ from moltrain import logs, progress
 from moltrain.grpo_core import build_batch, degenerate_groups
 
 from . import limits
-from .config import ConfigError, load_config, log_destination, resolve
+from .config import (
+    ConfigError,
+    latest_adapter,
+    load_config,
+    log_destination,
+    resolve,
+)
 from .episode import Task, build_prompt, run_episode
 from .properties import LinkerProperties
 from .protocol import ProtocolReport, score_protocol
@@ -162,24 +169,73 @@ def require_cuda(what: str) -> None:
 def should_resume_from_sft(cfg: dict[str, Any]) -> tuple[Path, bool]:
     """Where the SFT adapter is, and whether GRPO should continue from it.
 
-    A directory is not enough to go on: `sft.output_dir` exists as soon as
-    anything has written a log into it, and resuming from a directory with no
-    adapter in it fails inside peft rather than here. `adapter_config.json` is
-    what `save_pretrained` writes, so it is the honest test.
+    The path returned when one is found is the adapter itself, which may be a
+    checkpoint inside `sft.output_dir` rather than the directory; when none is
+    found it is the configured directory, so the message that reports the
+    miss names the place the user configured.
     """
-    adapter = resolve(cfg, cfg["sft"]["output_dir"])
-    wanted = bool(cfg["grpo"]["resume_from_sft"])
-    return adapter, wanted and (adapter / "adapter_config.json").is_file()
+    configured = resolve(cfg, cfg["sft"]["output_dir"])
+    if not bool(cfg["grpo"]["resume_from_sft"]):
+        return configured, False
+    found = latest_adapter(configured)
+    return (found or configured), found is not None
+
+
+def generation_adapter(cfg: dict[str, Any]) -> Path | None:
+    """The adapter vLLM must sample with, or None to mean the base model.
+
+    This refuses rather than quietly falling back, and the reason is specific
+    to this episode. The prompts in `episode.py` never spell out the ATEM call
+    syntax -- `<|start|>assistant to=TOOL<|message|><atem:invoke ...>` is
+    learned from the SFT traces and from nothing else. So a rollout sampled
+    from the base model emits prose, every turn is counted malformed, the
+    episode ends at turn one with no submission, and all of it is floored at
+    -1.0. In the report that is indistinguishable from a policy that tried the
+    chemistry and failed, and a whole GRPO run can be spent on it.
+
+    `enable_lora=True` was already being passed to every engine here while no
+    adapter ever was, which is exactly how that happened once.
+    """
+    adapter, found = should_resume_from_sft(cfg)
+    if found:
+        return adapter
+    if bool(cfg["grpo"]["resume_from_sft"]):
+        raise RuntimeError(
+            f"grpo.resume_from_sft is set but no adapter was found in {adapter} "
+            "(neither adapter_config.json there nor in any checkpoint-N/ under "
+            "it). Sampling would fall back to the base model, which has never "
+            "seen the ATEM tool-call format, so every episode would be floored "
+            "at -1.0 for emitting no parseable call. Finish or stop the SFT run "
+            "first, or set grpo.resume_from_sft: false to say you really do "
+            "mean the base model."
+        )
+    LOG.warning(
+        "grpo.resume_from_sft is false, so generation uses the BASE model. "
+        "Nothing has taught it the ATEM call format -- expect every turn to "
+        "be counted malformed."
+    )
+    return None
 
 
 def load_engine(cfg: dict[str, Any], where: Ranks) -> Any:
-    """One vLLM engine in this process, bound to this rank's device."""
+    """One vLLM engine in this process, bound to this rank's device.
+
+    The engine is started WITH the policy adapter attached. Every caller of
+    this function generates rollouts that are about to be scored, so there is
+    no caller for which the base model is the right answer -- see
+    `generation_adapter`, which refuses instead of guessing.
+    """
     require_cuda("starting a vLLM engine")
 
     import torch
     from vllm import LLM
 
-    from moltrain.policy import VLLMEngine
+    from moltrain.policy import VLLMEngine, build_lora_request, lora_rank
+
+    # Resolved before the engine is built, so a missing adapter costs a
+    # one-line refusal rather than the ninety seconds it takes to load 30B of
+    # weights and capture CUDA graphs first.
+    adapter = generation_adapter(cfg)
 
     if where.distributed:
         torch.cuda.set_device(where.local_rank)
@@ -190,6 +246,10 @@ def load_engine(cfg: dict[str, Any], where: Ranks) -> Any:
         "max_model_len": int(cfg["model"]["max_prompt_tokens"])
         + int(cfg["model"]["max_completion_tokens"]),
         "enable_lora": True,
+        # vLLM's own default is 16 and these adapters are r=32; an adapter
+        # above the engine's rank is rejected at load, after the weights are
+        # already resident.
+        "max_lora_rank": lora_rank(cfg),
         "trust_remote_code": True,
     }
     if where.distributed:
@@ -200,13 +260,17 @@ def load_engine(cfg: dict[str, Any], where: Ranks) -> Any:
         kwargs["distributed_executor_backend"] = "external_launcher"
 
     LOG.info(
-        "rank %d/%d starting vLLM on local device %d at %.2f memory utilisation",
+        "rank %d/%d starting vLLM on local device %d at %.2f memory utilisation, "
+        "sampling from %s",
         where.rank,
         where.world_size,
         where.local_rank,
         kwargs["gpu_memory_utilization"],
+        adapter if adapter else "the BASE model (no adapter)",
     )
-    return VLLMEngine(LLM(**kwargs))
+    return VLLMEngine(
+        LLM(**kwargs), build_lora_request(adapter) if adapter else None
+    )
 
 
 # ------------------------------------------------------------------ the scalar
@@ -606,7 +670,88 @@ def make_rollout_func(cfg: dict[str, Any], tasks_by_id: dict[str, Task]):
             )
         return payload
 
+    # The engine is handed back on the function object because TRL takes
+    # `rollout_func` as a plain callable and gives nothing back. `train` needs
+    # this exact engine -- the one that will generate the next group -- to
+    # re-point it at the freshly trained adapter after each step.
+    rollout_func.engine = engine  # type: ignore[attr-defined]
     return rollout_func
+
+
+def make_engine_sync(cfg: dict[str, Any], where: Ranks, engine: Any) -> Any:
+    """A TRL callback that keeps the sampling engine on the trained policy.
+
+    GRPO's advantage is a rollout's reward minus its group's mean, which is an
+    estimate of how much better THIS policy's sample was than this policy's
+    average. Draw the group from a different policy than the one being updated
+    and the quantity is no longer that; the step still runs, the loss still
+    falls, and none of it is the algorithm.
+
+    TRL syncs its own engine when it owns one. This package deliberately does
+    not let it own one -- `training_settings` turns `use_vllm` off so a rank
+    holds a single engine rather than two -- which means the sync is this
+    package's job and nothing else was doing it.
+
+    The adapter is written to a fresh per-step directory and the previous one
+    removed, rather than overwritten in place: vLLM caches an adapter by its
+    integer id, so the id has to change for the new weights to be read at all,
+    and a path that changes with it removes any question of which tensors were
+    served.
+    """
+    from transformers import TrainerCallback
+
+    from moltrain.policy import build_lora_request
+
+    every = int(cfg["grpo"].get("sync_engine_every_steps", 1) or 0)
+    # Per rank: both ranks hold their own engine and their own copy of the
+    # (identical, post-allreduce) weights, and one shared path would have them
+    # writing over each other mid-read.
+    root = resolve(cfg, cfg["grpo"]["output_dir"]) / f"_engine_rank{where.rank}"
+
+    class SyncAdapterToEngine(TrainerCallback):
+        def __init__(self) -> None:
+            self.previous: Path | None = None
+            self.syncs = 0
+
+        def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any):
+            step = int(getattr(state, "global_step", 0) or 0)
+            if every <= 0 or step % every:
+                return control
+
+            model = kwargs.get("model")
+            # accelerate hands back a wrapped model under DDP; the adapter is
+            # on the peft model underneath it.
+            while model is not None and not hasattr(model, "save_pretrained"):
+                model = getattr(model, "module", None)
+            if model is None:
+                raise RuntimeError(
+                    "the engine sync callback was given no model it could save "
+                    "an adapter from, so vLLM would keep sampling the policy "
+                    "this run started with. Set grpo.sync_engine_every_steps: 0 "
+                    "to accept that deliberately."
+                )
+
+            target = root / f"step-{step}"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(str(target))
+            # A new id, or vLLM serves the tensors it cached under the old one.
+            engine.lora_request = build_lora_request(target, adapter_id=step + 1)
+
+            if self.previous is not None and self.previous != target:
+                shutil.rmtree(self.previous, ignore_errors=True)
+            self.previous = target
+
+            self.syncs += 1
+            if self.syncs == 1 and where.is_main_process():
+                LOG.info(
+                    "engine sync is live: the adapter is written to %s and "
+                    "re-registered with vLLM every %d step(s)",
+                    root,
+                    every,
+                )
+            return control
+
+    return SyncAdapterToEngine()
 
 
 # ---------------------------------------------------------------- the training
@@ -775,6 +920,52 @@ def check(cfg: dict[str, Any]) -> int:
             "engine, so each rank would hold two engines. Set it false."
         )
 
+    # ------------------------------------------------------- the sampled policy
+    #
+    # The check that would have saved a run. `enable_lora=True` was passed to
+    # every engine here while no adapter ever was, so vLLM decoded from the
+    # base weights -- which have never seen the ATEM call format. Every episode
+    # ended at turn one with an unparseable turn and was floored at -1.0, and
+    # the report said "degenerate groups", which reads as a temperature
+    # problem and is not one.
+    print("\nthe sampled policy")
+    adapter, found = should_resume_from_sft(cfg)
+    wanted_adapter = bool(cfg["grpo"]["resume_from_sft"])
+    print(f"  grpo.resume_from_sft: {wanted_adapter}")
+    if found:
+        print(f"  adapter: {adapter}")
+        config_path = adapter / "adapter_config.json"
+        try:
+            adapter_r = int(json.loads(config_path.read_text()).get("r", 0))
+        except (OSError, ValueError, TypeError):
+            adapter_r = 0
+        ceiling = int(cfg["grpo"]["lora"]["r"])
+        print(f"  adapter rank: {adapter_r or 'unreadable'}  engine ceiling: {ceiling}")
+        if adapter_r > ceiling:
+            problems.append(
+                f"the adapter at {adapter} is rank {adapter_r} but the engine "
+                f"would be started with max_lora_rank={ceiling}, and vLLM "
+                "rejects an adapter above its ceiling after the weights are "
+                "already resident. Raise grpo.lora.r to match."
+            )
+    elif wanted_adapter:
+        problems.append(
+            f"grpo.resume_from_sft is set but no adapter was found in {adapter} "
+            "(no adapter_config.json there, and none in any checkpoint-N/ under "
+            "it). Generation would fall back to the base model, which has never "
+            "been taught the ATEM call format, so every episode would score the "
+            "floor. Finish or stop the SFT run first."
+        )
+    else:
+        print("  BASE MODEL -- nothing has taught it the ATEM call format")
+
+    sync = int(cfg["grpo"].get("sync_engine_every_steps", 1) or 0)
+    print(
+        "  engine sync: "
+        + (f"every {sync} step(s)" if sync > 0 else "OFF (rollouts stay on the "
+           "policy this run starts with)")
+    )
+
     if any(r.name == "trl" and r.ok for r in reports):
         try:
             from trl import GRPOConfig, GRPOTrainer
@@ -887,9 +1078,10 @@ async def _rollout_only(cfg: dict[str, Any], args: argparse.Namespace) -> int:
     expanded = rollout_tasks(tasks, num_generations)
     toolkit = build_toolkit(cfg)
     tokenizer = AutoTokenizer.from_pretrained(cfg["model"]["name"])
+    engine = load_engine(cfg, where)
     policy = build_policy(
         cfg,
-        load_engine(cfg, where),
+        engine,
         build_sampling_params(cfg),
         max_batch=len(expanded),
     )
@@ -921,6 +1113,13 @@ async def _rollout_only(cfg: dict[str, Any], args: argparse.Namespace) -> int:
     summary["generator_batches"] = policy.generator.batches
     summary["context_truncations"] = policy.truncations
     summary["rank"] = where.rank
+    # Which weights produced these numbers. A report that cannot say is how a
+    # base-model run was read as a degenerate-group problem for a day: every
+    # field in it was real and none of them was about the trained policy.
+    request = getattr(engine, "lora_request", None)
+    summary["adapter"] = (
+        str(getattr(request, "lora_path", request)) if request else "base model"
+    )
 
     if not where.is_main_process():
         # The other ranks have measured the same thing on a different shard;
@@ -1050,13 +1249,25 @@ def train(cfg: dict[str, Any], *, dry_run: bool = False) -> int:
         model = PeftModel.from_pretrained(base, str(adapter), is_trainable=True)
         peft_config = None
 
+    rollout_func = make_rollout_func(cfg, {t.task_id: t for t in tasks})
+
     trainer = GRPOTrainer(
         model=model,
         args=args,
         train_dataset=dataset,
         peft_config=peft_config,
-        rollout_func=make_rollout_func(cfg, {t.task_id: t for t in tasks}),
+        rollout_func=rollout_func,
     )
+    # Without this the engine started above samples the policy this run began
+    # with, for every one of `max_steps` steps, while the gradient is applied
+    # to an adapter that never generated a token.
+    if int(cfg["grpo"].get("sync_engine_every_steps", 1) or 0) > 0:
+        trainer.add_callback(make_engine_sync(cfg, where, rollout_func.engine))
+    elif where.is_main_process():
+        print(
+            "note: grpo.sync_engine_every_steps is 0, so every rollout in this "
+            "run is sampled from the policy it started with"
+        )
     LOG.info("starting GRPO; TRL reports its own progress from here")
     trainer.train()
     LOG.info("GRPO finished; saving the adapter")

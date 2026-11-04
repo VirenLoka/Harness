@@ -258,6 +258,16 @@ grpo:
     dropout: 0.05
   resume_from_sft: true
 
+  # Keep the vLLM engine on the weights being trained. GRPO's advantage is the
+  # spread inside a group, which only means anything if the group came from the
+  # current policy -- and with a custom rollout_func nothing syncs the adapter
+  # into the engine by itself. Left unsynced, every one of the 500 steps samples
+  # the step-0 policy while the gradient lands on weights that never generated a
+  # token, and the loss curve looks entirely normal throughout.
+  # 1 = every optimiser step, the only strictly on-policy value. Higher trades
+  # that for the per-step adapter write. 0 = off, for a frozen-policy measurement.
+  sync_engine_every_steps: 1
+
 evaluate:
   output_dir: runs/eval
   # OPTIMISATION.md's four arms. `unchanged` is the floor any arm must clear,

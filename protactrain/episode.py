@@ -611,6 +611,30 @@ async def run_episode(
 
         parsed = parse_assistant_text(text)
         result.n_malformed_calls += len(parsed.malformed)
+
+        # The raw turn, at DEBUG. A run reports `malformed_calls: 8` and
+        # `stop_reasons: {no_tool_call: 8}` and nothing else, which says a
+        # turn did not parse but never what it said -- and the counts look
+        # identical whether the model wrote prose, invented a tool, or emitted
+        # the right call with the wrong delimiter. The file handler is pinned
+        # at DEBUG regardless of console level, so this costs nothing at the
+        # prompt and is there when a rollout comes back empty.
+        LOG.debug(
+            "%s turn %d: %d chars, %d call(s), %d malformed\n%s",
+            task.task_id,
+            result.n_turns,
+            len(text),
+            len(parsed.tool_calls),
+            len(parsed.malformed),
+            text,
+        )
+        if parsed.malformed:
+            LOG.debug(
+                "%s turn %d rejected segment(s): %r",
+                task.task_id,
+                result.n_turns,
+                parsed.malformed,
+            )
         if parsed.reasoning:
             assistant_parts.append(parsed.reasoning)
         if parsed.final_text:

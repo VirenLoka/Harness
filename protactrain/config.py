@@ -272,6 +272,18 @@ DEFAULTS: dict[str, Any] = {
             "launcher": "torchrun",  # torchrun | accelerate
             "find_unused_parameters": False,
         },
+        # How often the sampling engine is re-pointed at the weights being
+        # trained. GRPO's advantage is the spread within a group, which is
+        # only meaningful if the group was drawn from the CURRENT policy: with
+        # a custom rollout_func nothing syncs the trained adapter into vLLM on
+        # its own, so without this the engine samples step 0's policy for the
+        # whole run while the gradient is applied to weights that never
+        # generated a token. 1 is every optimiser step and is the only value
+        # that is strictly on-policy; a larger number trades that for the
+        # adapter write (hundreds of MB) and is off-policy by up to that many
+        # steps. 0 turns the sync off, which is only honest for a frozen-policy
+        # measurement.
+        "sync_engine_every_steps": 1,
         "lora": {"r": 32, "alpha": 64, "dropout": 0.05},
         "resume_from_sft": True,
     },
@@ -354,6 +366,58 @@ def resolve(cfg: dict[str, Any], value: str | Path) -> Path:
     """Resolve a config path relative to the package directory."""
     candidate = Path(value).expanduser()
     return candidate if candidate.is_absolute() else (PACKAGE_DIR / candidate).resolve()
+
+
+def latest_adapter(directory: Path) -> Path | None:
+    """The adapter saved in `directory`, else the one in its newest checkpoint.
+
+    `save_pretrained` writes `adapter_config.json` beside the weights, so that
+    file -- not the directory -- is the honest test for "an adapter is here":
+    an output directory exists as soon as anything writes a log into it, and
+    pointing peft or vLLM at an empty one fails several frames down rather
+    than at the call that meant it.
+
+    The checkpoint fallback is not a convenience. A warmup is routinely
+    stopped once its entropy has collapsed (see `sft.max_steps`), and a
+    stopped run never reaches `save_model`, so the only adapter on disk is the
+    one inside `checkpoint-N/`. Without this the next stage starts from the
+    base model instead, which is the failure the callers of this function
+    exist to make impossible.
+
+    Lives here rather than in `grpo.py` so that `evaluate` and `traces` can
+    ask the question without importing the training stack behind it.
+    """
+    if (directory / "adapter_config.json").is_file():
+        return directory
+    best: tuple[int, Path] | None = None
+    for child in sorted(directory.glob("checkpoint-*")):
+        if not (child / "adapter_config.json").is_file():
+            continue
+        try:
+            step = int(child.name.rsplit("-", 1)[-1])
+        except ValueError:
+            continue
+        if best is None or step > best[0]:
+            best = (step, child)
+    return best[1] if best else None
+
+
+def trained_adapter(cfg: dict[str, Any]) -> tuple[Path | None, list[Path]]:
+    """The newest trained policy on disk, and everywhere that was looked.
+
+    GRPO's output first, then SFT's: stage 3 continues stage 2's adapter, so
+    when both exist the GRPO one is strictly the later policy. The list of
+    places searched is returned so a caller that has to refuse can name them.
+    """
+    searched = [
+        resolve(cfg, cfg["grpo"]["output_dir"]),
+        resolve(cfg, cfg["sft"]["output_dir"]),
+    ]
+    for directory in searched:
+        found = latest_adapter(directory)
+        if found is not None:
+            return found, searched
+    return None, searched
 
 
 def resolve_sibling(cfg: dict[str, Any], key: str) -> Path:

@@ -610,12 +610,34 @@ def unchanged_factory() -> Callable[[Any], Callable[[str], str]]:
 
 
 def build_arm_factory(cfg: dict[str, Any], arm: str) -> Callable[[Any], Any]:
-    """The `generate` factory for one arm."""
+    """The `generate` factory for one arm.
+
+    All three GPU arms sample the SAME trained adapter. `one_shot` is not the
+    base model -- it is this policy with the tools taken away and the episode
+    capped at one turn (see `_arm_config`), which is what makes the gap
+    between it and `policy` readable as the value of the tool loop rather than
+    as the gap between two different models.
+    """
     if arm == "unchanged":
         return unchanged_factory()
+    from .config import trained_adapter
     from .policy import vllm_factory
 
-    return vllm_factory(cfg)
+    adapter, searched = trained_adapter(cfg)
+    if adapter is None:
+        # Refusing beats reporting. An arm named `policy` sampled from the
+        # base model produces a full report of numbers that look like results
+        # and measure nothing -- and the base model has never seen the ATEM
+        # call format, so every arm but `unchanged` would score the floor.
+        where = ", ".join(str(path) for path in searched)
+        raise RuntimeError(
+            f"the {arm} arm needs a trained adapter and none was found in "
+            f"{where} (no adapter_config.json, in those directories or in any "
+            "checkpoint-N/ under them). Train one first, or evaluate only the "
+            "`unchanged` arm by setting evaluate.arms in the config."
+        )
+    LOG.info("%s arm sampling from %s", arm, adapter)
+    return vllm_factory(cfg, adapter)
 
 
 def attempts_for(cfg: dict[str, Any], arm: str) -> int:

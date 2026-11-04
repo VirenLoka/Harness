@@ -379,9 +379,24 @@ async def _run(cfg: dict[str, Any], args: argparse.Namespace) -> int:
     if args.source == "scripted":
         factory = scripted_factory(cfg)
     else:
+        from .config import trained_adapter
         from .policy import vllm_factory
 
-        factory = vllm_factory(cfg)
+        # Same refusal as `evaluate`: traces sampled from the base model are
+        # prose with no parseable call in it, so every episode would be
+        # dropped as inadmissible and the collection would report a clean run
+        # that produced nothing usable.
+        adapter, searched = trained_adapter(cfg)
+        if adapter is None:
+            where = ", ".join(str(path) for path in searched)
+            print(
+                f"--source model needs a trained adapter and none was found "
+                f"in {where}. Collect scripted traces first, or train one.",
+                file=sys.stderr,
+            )
+            return 1
+        LOG.info("collecting model traces with the adapter at %s", adapter)
+        factory = vllm_factory(cfg, adapter)
 
     records, episodes, report = await collect(
         cfg,
