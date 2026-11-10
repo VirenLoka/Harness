@@ -50,6 +50,19 @@ export VLLM_API_KEY=<your key>
 python serve.py                                  # uses configs/default.yaml
 ```
 
+The packaged config serves a trained adapter, not just the base model, and
+sets `lora.required: true` — so it **exits 2 without starting** until one
+resolves under `protactrain/runs/grpo` or `protactrain/runs/sft`:
+
+```
+ERROR No adapter found for protac-policy -> .../runs/grpo, .../runs/sft.
+```
+
+That is deliberate: a server whose job is to serve the policy should say so
+rather than come up on base weights. To serve the base model alone — which is
+what the rest of this README describes — set `lora.required: false`, or drop
+the `lora` section from your config. See *Serving a trained adapter*.
+
 Options:
 
 ```bash
@@ -61,7 +74,10 @@ python serve.py --dry-run                        # print the vllm command only
 
 `--model` only swaps the checkpoint. The parsers and the drafter in the config
 stay, so use it for other Muse Glimmer variants (the FP8 one above is untested
-here) and write a separate config for other model families.
+here) and write a separate config for other model families. It does not
+repoint `lora.modules` either: an adapter trained against one base stays
+attached to whatever `--model` names, which is a second reason to keep it to
+variants of the same model.
 
 Once vLLM is healthy, the server prints the URLs and writes them to
 `run/endpoint.json` (removed again on shutdown). Stop it with Ctrl+C or
@@ -183,6 +199,8 @@ See `configs/default.yaml` for every option with comments. The main sections:
 - `vllm_args`: passed to `vllm serve` (`snake_case` becomes `--kebab-case`;
   `false` becomes `--no-<flag>`). `host`, `port` and `api_key` are rejected
   here because the launcher controls them.
+- `lora`: adapters served alongside the base model (see *Serving a trained
+  adapter*).
 - `env`: extra environment variables for the vLLM process.
 - `server`: gateway bind address and port, internal vLLM port, the name of the
   env var holding the key, public paths, allowed prefixes, startup timeout, and
@@ -193,6 +211,66 @@ See `configs/default.yaml` for every option with comments. The main sections:
 The API key is never read from the config file. It comes from the environment
 variable named in `server.api_key_env` and is handed to vLLM through its
 environment, so it doesn't appear in `ps` output.
+
+## Serving a trained adapter
+
+A policy trained by `protactrain` is a LoRA adapter, not a checkpoint, and
+`--enable-lora` on its own does not serve it: that flag reserves the slots and
+the kernels, and vLLM keeps decoding from the base weights until an adapter is
+named on the command line *and* requested by name. The failure mode is quiet —
+the server is healthy, every request succeeds, and the model answering has
+never seen the task.
+
+The `lora` section is how an adapter gets named:
+
+```yaml
+lora:
+  modules:
+    protac-policy: [protactrain/runs/grpo, protactrain/runs/sft]
+  required: true
+  max_rank: null
+  max_loras: 1
+```
+
+Each key becomes a model name clients send as `"model"`; the base model keeps
+`served_model_name` and stays reachable, so one server answers both:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer $VLLM_API_KEY" \
+  -d '{"model": "protac-policy", "messages": [...]}'   # the trained policy
+```
+
+A value is a directory, or a list tried in order. Within a directory the
+launcher takes the finished adapter, else the highest `checkpoint-N`, else the
+highest copy the GRPO engine sync left in `_engine_rank0/` — so a run stopped
+early is still servable without moving files by hand. Listing the GRPO output
+ahead of the SFT one means the name follows the policy across stages with no
+edit here in between.
+
+`required: true` refuses to start when a module resolves to nothing, rather
+than coming up on base weights. `max_rank: null` reads `r` out of each
+`adapter_config.json`; vLLM's own ceiling is 16 and it rejects anything above
+it, so leaving this unset is what keeps a rank-32 adapter loadable.
+
+`enable_lora`, `lora_modules`, `max_lora_rank` and `max_loras` are rejected
+under `vllm_args` — the launcher owns them, and a hand-written `--lora-modules`
+would silently win over the resolved one.
+
+Which weights are live is printed at startup and written to
+`server.endpoint_file`:
+
+```json
+{"model": "muse-glimmer-30b",
+ "models": ["muse-glimmer-30b", "protac-policy"],
+ "adapters": {"protac-policy": "/.../protactrain/runs/grpo/checkpoint-500"}}
+```
+
+> vLLM has historically refused LoRA together with speculative decoding. The
+> packaged config sets both (`speculative_config` uses the DFlash drafter), and
+> the launcher warns when it sees the combination. If vLLM rejects it, drop
+> `speculative_config`: the drafter is a throughput win, the adapter is the
+> policy.
 
 ## Quantization
 

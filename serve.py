@@ -43,6 +43,12 @@ MIN_KEY_LENGTH = 24
 DEFAULTS: dict[str, Any] = {
     "model": "meta-models/Muse-Glimmer-30B",
     "vllm_args": {},
+    "lora": {
+        "modules": {},
+        "required": True,
+        "max_rank": None,
+        "max_loras": 1,
+    },
     "env": {},
     "server": {
         "host": "0.0.0.0",
@@ -64,7 +70,36 @@ DEFAULTS: dict[str, Any] = {
 }
 
 # Flags the launcher owns; setting them in vllm_args would bypass the gateway.
-RESERVED_VLLM_ARGS = {"model", "host", "port", "api_key"}
+# The LoRA four are owned because the launcher resolves `lora.modules` to the
+# adapter on disk and sizes the rank from it -- a hand-written `--lora-modules`
+# would silently win over that and serve whatever path it named, including one
+# that no longer holds the newest policy.
+RESERVED_VLLM_ARGS = {
+    "model",
+    "host",
+    "port",
+    "api_key",
+    "enable_lora",
+    "lora_modules",
+    "max_lora_rank",
+    "max_loras",
+}
+
+# A `--lora-modules` entry is `name=path`, and vLLM's parser is not forgiving
+# about it: it takes the `name=path` branch only for an item that contains "="
+# and NO ",", and sends anything else to `json.loads` -- so a comma anywhere
+# exits with "Invalid JSON format for --lora-modules", and a second "=" reaches
+# `name, path = item.split("=")` and raises an unhandled ValueError inside
+# argparse. Both land minutes in, after the base model has finished loading, so
+# both are screened here instead. The path is screened as well as the name: it
+# comes from the filesystem, and `runs/lr=3e-6,r32/` is an ordinary way for a
+# sweep to name a directory.
+BAD_IN_LORA_NAME = set("=, \t\n/")
+BAD_IN_LORA_PATH = set("=,")
+
+# vLLM's own default, and the floor this launcher asks for. Asking for a
+# ceiling below the adapter's rank makes vLLM reject the adapter at load.
+MIN_LORA_RANK = 16
 
 log = logging.getLogger("serve")
 
@@ -132,13 +167,206 @@ def to_cli_args(options: dict[str, Any]) -> list[str]:
     return args
 
 
+# ------------------------------------------------------------------ adapters
+
+
+def latest_adapter(directory: Path) -> Path | None:
+    """The adapter saved in `directory`, else the one in its newest checkpoint.
+
+    `adapter_config.json` -- not the directory -- is the honest test for "an
+    adapter is here": a run directory exists as soon as anything writes a log
+    into it, and pointing vLLM at an empty one fails several frames down
+    rather than at the call that meant it.
+
+    The fallbacks are not a convenience. A warmup is routinely stopped once
+    its entropy has collapsed, and a stopped run never reaches `save_model`,
+    so the only adapter on disk is the one inside `checkpoint-N/`. A GRPO run
+    stopped mid-flight may not even have that -- `save_steps` defaults to the
+    whole run -- and its only surviving weights are the copies its engine sync
+    wrote for vLLM to sample from.
+
+    Deliberately a copy of `protactrain.config.latest_adapter` rather than an
+    import of it: importing anything under `protactrain` runs that package's
+    `__init__`, which sets OMP_NUM_THREADS, PYTORCH_CUDA_ALLOC_CONF and the
+    vLLM multiprocessing method via `os.environ.setdefault` -- and this
+    launcher hands its environment straight to the vLLM subprocess, so the
+    import alone would silently re-tune the server's CPU threading. The two
+    copies are pinned together by a test.
+    """
+    if (directory / "adapter_config.json").is_file():
+        return directory
+    found = _newest_step(directory.glob("checkpoint-*"))
+    if found is not None:
+        return found
+    # Rank 0 deliberately, not whichever sorts first: the ranks hold identical
+    # post-allreduce weights, and picking one on purpose beats picking one by
+    # accident.
+    return _newest_step((directory / "_engine_rank0").glob("step-*"))
+
+
+def _newest_step(candidates: Any) -> Path | None:
+    """The candidate with the highest trailing -N that holds an adapter.
+
+    By step, not by name: `checkpoint-1000` sorts before `checkpoint-300` as a
+    string, and the string order would quietly serve an older policy.
+    """
+    best: tuple[int, Path] | None = None
+    for child in candidates:
+        if not (child / "adapter_config.json").is_file():
+            continue
+        try:
+            step = int(child.name.rsplit("-", 1)[-1])
+        except ValueError:
+            continue
+        if best is None or step > best[0]:
+            best = (step, child)
+    return best[1] if best else None
+
+
+def adapter_rank(adapter: Path) -> int | None:
+    """The `r` peft recorded when it saved this adapter.
+
+    Read rather than configured, because vLLM rejects an adapter whose rank
+    exceeds `--max-lora-rank` and its own default is 16 -- below the 32 these
+    runs train with. A number copied into the YAML is one more thing that can
+    disagree with the weights on disk.
+    """
+    try:
+        meta = json.loads((adapter / "adapter_config.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    rank = meta.get("r")
+    return int(rank) if isinstance(rank, int) and rank > 0 else None
+
+
+def resolve_lora_modules(
+    cfg: dict[str, Any],
+) -> tuple[list[tuple[str, Path]], list[tuple[str, list[Path]]]]:
+    """Each configured module paired with the adapter it resolves to.
+
+    A module's value is a directory, or a list of directories tried in order
+    -- which is how one name follows a policy across stages: list the GRPO
+    output before the SFT one and the name serves the RL policy once it
+    exists and the warmup until then, with no config edit between.
+
+    Returns `(found, missing)`: `found` as (name, adapter directory),
+    `missing` as (name, every directory searched) so a caller can say where
+    it looked. Raises when `lora.required` and anything is missing, which is
+    the whole point of the knob -- a server whose job is to serve the trained
+    policy should refuse to come up serving base weights instead.
+    """
+    section = cfg.get("lora") or {}
+    modules = section.get("modules") or {}
+    if not isinstance(modules, dict):
+        raise ServeError("lora.modules must be a mapping of name -> directory.")
+
+    base_name = cfg["vllm_args"].get("served_model_name") or cfg["model"]
+    base_names = {base_name} if isinstance(base_name, str) else set(base_name or ())
+
+    found: list[tuple[str, Path]] = []
+    missing: list[tuple[str, Path]] = []
+    for name, value in modules.items():
+        name = str(name)
+        if not name or name.startswith("-") or BAD_IN_LORA_NAME & set(name):
+            raise ServeError(
+                f"lora.modules name {name!r} cannot start with '-' or contain "
+                "'=', ',', '/' or whitespace; it goes on vLLM's command line as "
+                "`name=path` and is sent by clients as the `model` field."
+            )
+        if name in base_names:
+            raise ServeError(
+                f"lora.modules name {name!r} is already the base model's served "
+                "name; clients could not address one without the other."
+            )
+        raw = value if isinstance(value, (list, tuple)) else [value]
+        if not raw:
+            raise ServeError(f"lora.modules {name!r} names no directory.")
+        searched: list[Path] = []
+        for entry in raw:
+            directory = Path(str(entry)).expanduser()
+            if not directory.is_absolute():
+                directory = (SCRIPT_DIR / directory).resolve()
+            searched.append(directory)
+        for directory in searched:
+            adapter = latest_adapter(directory)
+            if adapter is not None:
+                if BAD_IN_LORA_PATH & set(str(adapter)):
+                    raise ServeError(
+                        f"The adapter for {name!r} is at {adapter}, which "
+                        "contains '=' or ','. vLLM cannot read that as "
+                        "`name=path` and refuses to start once the base model "
+                        "is already loaded. Move or symlink it somewhere "
+                        "without them."
+                    )
+                if "_engine_rank" in adapter.parent.name:
+                    log.warning(
+                        "%r resolves to %s, a copy GRPO's engine sync wrote "
+                        "mid-run. If that run is still training it deletes "
+                        "this directory on its next step, and vLLM will not "
+                        "find it. Serve a checkpoint-N or a finished adapter "
+                        "instead once one exists.",
+                        name,
+                        adapter,
+                    )
+                found.append((name, adapter))
+                break
+        else:
+            missing.append((name, searched))
+
+    if missing and section.get("required", True):
+        detail = "; ".join(
+            f"{name} -> {', '.join(str(p) for p in where)}" for name, where in missing
+        )
+        raise ServeError(
+            f"No adapter found for {detail}. Train one, point lora.modules at "
+            "the right directory, or set lora.required: false to serve the "
+            "base model without it."
+        )
+    return found, missing
+
+
+def lora_cli_args(
+    cfg: dict[str, Any], found: list[tuple[str, Path]]
+) -> list[str]:
+    """`vllm serve` flags for the resolved adapters, or nothing at all.
+
+    `--enable-lora` on its own only reserves the slots and kernels; an adapter
+    is served because it is named here and requested by name per call.
+    """
+    if not found:
+        return []
+    section = cfg.get("lora") or {}
+    # A configured ceiling raises the floor; it never caps below what is on
+    # disk. Asking for 16 while serving a rank-32 adapter is rejected by vLLM
+    # after the base model is resident -- and the rank is right here to be
+    # read, so there is no reason to let a hand-written number lose to it.
+    configured = section.get("max_rank")
+    ranks = [rank for _, path in found if (rank := adapter_rank(path))]
+    floor = int(configured) if configured else MIN_LORA_RANK
+    max_rank = max([floor, *ranks])
+    args = [
+        "--enable-lora",
+        "--max-lora-rank",
+        str(max_rank),
+        "--max-loras",
+        str(int(section.get("max_loras") or 1)),
+        "--lora-modules",
+    ]
+    return args + [f"{name}={path}" for name, path in found]
+
+
 def vllm_executable() -> list[str]:
     # Jupyter kernels often have vllm importable without its script on PATH.
     exe = shutil.which("vllm")
     return [exe] if exe else [sys.executable, "-m", "vllm.entrypoints.cli.main"]
 
 
-def build_vllm_command(cfg: dict[str, Any]) -> list[str]:
+def build_vllm_command(
+    cfg: dict[str, Any], found: list[tuple[str, Path]]
+) -> list[str]:
+    # The LoRA flags go last because `--lora-modules` takes a variable number
+    # of `name=path` values; anything after it is one more thing that has to
+    # be unambiguously not-a-module.
     return [
         *vllm_executable(),
         "serve",
@@ -148,6 +376,7 @@ def build_vllm_command(cfg: dict[str, Any]) -> list[str]:
         "--port",
         str(cfg["server"]["vllm_port"]),
         *to_cli_args(cfg["vllm_args"]),
+        *lora_cli_args(cfg, found),
     ]
 
 
@@ -373,7 +602,30 @@ def main(argv: list[str] | None = None) -> int:
     if args.tunnel is not None:
         cfg["tunnel"]["enabled"] = args.tunnel
 
-    cmd = build_vllm_command(cfg)
+    # Resolved before the dry-run returns, so `--dry-run` refuses exactly what
+    # the real run would refuse instead of printing a command that cannot run.
+    try:
+        found, missing = resolve_lora_modules(cfg)
+    except ServeError as exc:
+        log.error("%s", exc)
+        return 2
+    for name, where in missing:
+        log.warning(
+            "No adapter under %s; %r will not be served.",
+            ", ".join(str(p) for p in where),
+            name,
+        )
+    for name, adapter in found:
+        log.info("Adapter %r: %s", name, adapter)
+    if found and cfg["vllm_args"].get("speculative_config"):
+        log.warning(
+            "Adapters and speculative decoding are configured together. If "
+            "vLLM refuses the combination, drop speculative_config from "
+            "vllm_args -- the drafter is a throughput win, the adapter is the "
+            "policy."
+        )
+
+    cmd = build_vllm_command(cfg, found)
     if args.dry_run:
         print(shlex.join(cmd))
         return 0
@@ -404,6 +656,11 @@ def main(argv: list[str] | None = None) -> int:
             served_name = served_name[0]
         info = {
             "model": served_name,
+            # Every name a client may send as `model`. An adapter is addressed
+            # by its own name, so a reader of this file can tell at a glance
+            # whether the trained policy is reachable or only the base weights.
+            "models": [served_name, *(name for name, _ in found)],
+            "adapters": {name: str(adapter) for name, adapter in found},
             "local_url": f"http://127.0.0.1:{port}/v1",
             "public_url": None,
             "pid": os.getpid(),
@@ -414,7 +671,11 @@ def main(argv: list[str] | None = None) -> int:
         if endpoint_path:
             write_endpoint_file(endpoint_path, info)
 
-        log.info("Ready. Model: %s", info["model"])
+        log.info("Ready. Base model: %s", info["model"])
+        for name, adapter in found:
+            log.info("  Adapter: %s  (%s)", name, adapter)
+        if not found:
+            log.warning("  No adapter is being served; this is the base model.")
         log.info("  Local : %s", info["local_url"])
         if info["public_url"]:
             log.info("  Public: %s", info["public_url"])
