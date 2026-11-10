@@ -127,6 +127,37 @@ def _arm_config(cfg: dict[str, Any], arm: str) -> dict[str, Any]:
     return narrowed
 
 
+def require_adapter(cfg: dict[str, Any], arms: Sequence[str]) -> str:
+    """Refuse a policy arm with no policy to sample. Returns a reason, or "".
+
+    Checked beside `require_cuda`, before any arm runs, and that placement is
+    the point: the arms run in order and nothing is written until the loop
+    ends, so refusing inside the loop would throw away a completed
+    `unchanged` arm -- the expensive RDKit re-measurement over every drawn
+    task -- and write no report at all.
+
+    An arm named `policy` sampled from base weights is not a weaker result.
+    The base model has never seen the ATEM call format, so every episode ends
+    unparsed and floored, and the report is a full page of numbers about
+    nothing.
+    """
+    if not GPU_ARMS.intersection(arms):
+        return ""
+    from .config import trained_adapter
+
+    adapter, searched = trained_adapter(cfg)
+    if adapter is not None:
+        return ""
+    wanted = ", ".join(a for a in arms if a in GPU_ARMS)
+    where = ", ".join(str(path) for path in searched)
+    return (
+        f"refusing to run the `{wanted}` arm(s): they need a trained adapter "
+        f"and none was found in {where} (no adapter_config.json there, and "
+        "none in any checkpoint-N/ under them). Train one first, or run only "
+        "the control arm with `--arms unchanged`."
+    )
+
+
 def require_cuda(arms: Sequence[str]) -> str:
     """Refuse a model pass on a machine with no GPU. Returns a reason, or "".
 
@@ -630,12 +661,7 @@ def build_arm_factory(cfg: dict[str, Any], arm: str) -> Callable[[Any], Any]:
         # and measure nothing -- and the base model has never seen the ATEM
         # call format, so every arm but `unchanged` would score the floor.
         where = ", ".join(str(path) for path in searched)
-        raise RuntimeError(
-            f"the {arm} arm needs a trained adapter and none was found in "
-            f"{where} (no adapter_config.json, in those directories or in any "
-            "checkpoint-N/ under them). Train one first, or evaluate only the "
-            "`unchanged` arm by setting evaluate.arms in the config."
-        )
+        raise RuntimeError(require_adapter(cfg, [arm]) or f"no adapter for {arm}")
     LOG.info("%s arm sampling from %s", arm, adapter)
     return vllm_factory(cfg, adapter)
 
@@ -1386,10 +1412,10 @@ def render_interpretation(cells: Sequence[dict[str, Any]], out: Any = sys.stdout
 async def _run(cfg: dict[str, Any], args: argparse.Namespace) -> int:
     from .tasks import read_tasks
 
-    refusal = require_cuda(args.arms)
-    if refusal:
-        print(refusal, file=sys.stderr)
-        return 3
+    for refusal in (require_cuda(args.arms), require_adapter(cfg, args.arms)):
+        if refusal:
+            print(refusal, file=sys.stderr)
+            return 3
 
     evaluated = evaluation_config(cfg)
     tasks = read_tasks(evaluated, args.tasks)

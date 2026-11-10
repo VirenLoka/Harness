@@ -939,14 +939,22 @@ def check(cfg: dict[str, Any]) -> int:
             adapter_r = int(json.loads(config_path.read_text()).get("r", 0))
         except (OSError, ValueError, TypeError):
             adapter_r = 0
-        ceiling = int(cfg["grpo"]["lora"]["r"])
+        # `lora_rank(cfg)`, which is what `load_engine` passes -- not
+        # grpo.lora.r. The two differ whenever the warmup was trained at a
+        # higher rank, and a preflight that fails a runnable config while
+        # advising a change to the rank GRPO trains with is worse than no
+        # preflight. In the resume path `peft_config` is None, so grpo.lora.r
+        # is not the rank of anything being trained anyway.
+        from moltrain.policy import lora_rank
+
+        ceiling = lora_rank(cfg)
         print(f"  adapter rank: {adapter_r or 'unreadable'}  engine ceiling: {ceiling}")
         if adapter_r > ceiling:
             problems.append(
                 f"the adapter at {adapter} is rank {adapter_r} but the engine "
                 f"would be started with max_lora_rank={ceiling}, and vLLM "
                 "rejects an adapter above its ceiling after the weights are "
-                "already resident. Raise grpo.lora.r to match."
+                "already resident. Raise grpo.lora.r or sft.lora.r to match."
             )
     elif wanted_adapter:
         problems.append(
@@ -1200,12 +1208,14 @@ def train(cfg: dict[str, Any], *, dry_run: bool = False) -> int:
     # gradients for two different models is a failure that shows up as a
     # slightly odd loss curve and nothing else.
     adapter, resume = should_resume_from_sft(cfg)
-    if cfg["grpo"]["resume_from_sft"] and not resume and where.is_main_process():
-        print(
-            f"note: grpo.resume_from_sft is set but {adapter} holds no "
-            "adapter_config.json, so GRPO starts from the base model and the "
-            "SFT warmup is not used"
-        )
+
+    # Asked here, before anything is loaded, and not only inside
+    # `make_rollout_func` where the engine is built. It raises on the same
+    # state `check` objects to, so --dry-run now refuses whatever the real run
+    # refuses -- it used to print that training would proceed from the base
+    # model and exit 0, for a configuration the real run dies on an hour
+    # later, after the tokenizer and 30B of weights.
+    generation_adapter(cfg)
 
     if where.is_main_process():
         print(f"model   : {model}")
@@ -1272,6 +1282,14 @@ def train(cfg: dict[str, Any], *, dry_run: bool = False) -> int:
     trainer.train()
     LOG.info("GRPO finished; saving the adapter")
     trainer.save_model(args.output_dir)
+    # The sync's working copies, now redundant: `save_model` has just written
+    # the same weights at the top level, and each rank's copy is a full
+    # duplicate of them. They are deliberately left in place while a run is
+    # alive -- `latest_adapter` reads rank 0's as the last resort for a run
+    # that was stopped before it ever reached this line -- so this is the one
+    # point at which removing them cannot lose anything.
+    for leftover in Path(args.output_dir).glob("_engine_rank*"):
+        shutil.rmtree(leftover, ignore_errors=True)
     if where.is_main_process():
         Path(args.output_dir, "protactrain_grpo.json").write_text(
             json.dumps(

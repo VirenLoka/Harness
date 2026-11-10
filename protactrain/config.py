@@ -389,8 +389,28 @@ def latest_adapter(directory: Path) -> Path | None:
     """
     if (directory / "adapter_config.json").is_file():
         return directory
+    found = _newest_step(directory.glob("checkpoint-*"))
+    if found is not None:
+        return found
+    # Last resort: the copy GRPO's engine sync left behind. A GRPO run writes
+    # a Trainer checkpoint only every `save_steps` (TrainingArguments defaults
+    # to 500, which is the whole run as configured), so a run stopped at step
+    # 300 has no checkpoint-N and never reached `save_model` -- and its only
+    # surviving weights are the ones the sync wrote for vLLM to sample. Rank 0
+    # deliberately, not whichever sorts first: the ranks hold identical
+    # post-allreduce weights, and picking one on purpose beats picking one by
+    # accident.
+    return _newest_step((directory / "_engine_rank0").glob("step-*"))
+
+
+def _newest_step(candidates: Any) -> Path | None:
+    """The candidate with the highest trailing -N that holds an adapter.
+
+    By step, not by name: `checkpoint-1000` sorts before `checkpoint-300` as
+    a string, and the string order would quietly return an older policy.
+    """
     best: tuple[int, Path] | None = None
-    for child in sorted(directory.glob("checkpoint-*")):
+    for child in candidates:
         if not (child / "adapter_config.json").is_file():
             continue
         try:

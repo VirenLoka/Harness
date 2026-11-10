@@ -240,7 +240,11 @@ def lora_rank(cfg: dict[str, Any], default: int = 16) -> int:
     """
     ranks = [default]
     for section in ("grpo", "sft"):
-        rank = (cfg.get(section) or {}).get("lora", {}).get("r")
+        # `or {}` twice: YAML writes None for a key with nothing under it, so
+        # both `grpo:` and `grpo:\n  lora:` reach here as None. Raising an
+        # AttributeError from inside engine construction on the GPU host is a
+        # poor way to report a config typo.
+        rank = ((cfg.get(section) or {}).get("lora") or {}).get("r")
         if rank:
             ranks.append(int(rank))
     return max(ranks)

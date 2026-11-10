@@ -97,11 +97,15 @@ def load_engine(cfg: dict[str, Any], adapter: Any = None) -> VLLMEngine:
     engines on device 0, which is the exact trap `grpo.py` exists to avoid, so
     it is better that this one stays obviously non-distributed.
 
-    `adapter` defaults to None because this loader's callers are not all the
-    same: `evaluate`'s `one_shot` arm wants the base model by definition,
-    while its `policy` arm and the model-sourced trace collection want the
-    trained one. The caller says which; passing nothing means the base model
-    and is a choice, not a default to fall into.
+    `adapter` defaults to None so that a caller with no policy to sample --
+    a test, or a probe that only wants an engine -- can still build one. It is
+    NOT the normal case here: every current caller passes a trained adapter.
+    `evaluate`'s `one_shot` arm in particular is not the base model, it is the
+    same trained policy with its tools removed (see `evaluate._arm_config`),
+    which is what makes the gap between `one_shot` and `policy` readable as
+    the value of the tool loop rather than as the gap between two models.
+    Passing nothing means the base model and is a choice, never a default to
+    fall into.
     """
     require_cuda("starting a vLLM engine")
 

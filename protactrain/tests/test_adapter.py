@@ -382,3 +382,177 @@ def test_the_ranks_do_not_write_over_each_other(tmp_path, monkeypatch):
 
     written = sorted(p.name for p in (tmp_path / "grpo").iterdir())
     assert written == ["_engine_rank0", "_engine_rank1"]
+
+
+# ------------------------------------------------- the wiring, not the halves
+#
+# The tests above check that VLLMEngine CAN carry a request and that
+# generation_adapter COMPUTES a path. Neither asserts the two are joined, and
+# a review proved the gap by reverting every wiring line -- `VLLMEngine(llm)`,
+# the dropped second argument, `max_lora_rank` -- and watching all of them
+# stay green. That is the original bug exactly: both halves present, nothing
+# connecting them. These call `load_engine` itself, against a stubbed vLLM, so
+# the connection is what is under test.
+
+
+def _stub_vllm(monkeypatch) -> dict:
+    """A vLLM whose only job is to record how it was constructed."""
+    built: dict = {}
+
+    vllm = types.ModuleType("vllm")
+
+    class _LLM:
+        def __init__(self, **kwargs):
+            built["llm_kwargs"] = kwargs
+
+    vllm.LLM = _LLM
+
+    class _LoRARequest:
+        def __init__(self, name, lora_int_id, lora_path):
+            self.lora_name = name
+            self.lora_int_id = lora_int_id
+            self.lora_path = lora_path
+
+    lora = types.ModuleType("vllm.lora")
+    request = types.ModuleType("vllm.lora.request")
+    request.LoRARequest = _LoRARequest
+    lora.request = request
+    vllm.lora = lora
+
+    for name, module in (
+        ("vllm", vllm),
+        ("vllm.lora", lora),
+        ("vllm.lora.request", request),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    return built
+
+
+def _stub_torch(monkeypatch) -> None:
+    """Keep the real torch out of sys.modules; test_integration checks."""
+    torch = types.ModuleType("torch")
+    cuda = types.ModuleType("torch.cuda")
+    cuda.device_count = lambda: 2
+    cuda.set_device = lambda _index: None
+    torch.cuda = cuda
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch.cuda", cuda)
+
+
+def test_moltrain_load_engine_hands_the_adapter_to_the_engine(tmp_path, monkeypatch):
+    from moltrain.policy import load_engine
+
+    built = _stub_vllm(monkeypatch)
+    engine = load_engine(load_config(), _adapter(tmp_path / "sft"))
+
+    assert engine.lora_request is not None, "the engine would decode base weights"
+    assert str(engine.lora_request.lora_path) == str(tmp_path / "sft")
+    # vLLM's own default is 16 and these adapters are r=32. Without this the
+    # adapter is rejected after 30B of weights are already resident.
+    assert built["llm_kwargs"]["max_lora_rank"] == 32
+    assert built["llm_kwargs"]["enable_lora"] is True
+
+
+def test_the_single_process_loader_hands_it_over_too(tmp_path, monkeypatch):
+    import protactrain.policy as policy
+
+    built = _stub_vllm(monkeypatch)
+    monkeypatch.setattr(policy, "require_cuda", lambda _what: None)
+    engine = policy.load_engine(load_config(), _adapter(tmp_path / "grpo"))
+
+    assert engine.lora_request is not None
+    assert str(engine.lora_request.lora_path) == str(tmp_path / "grpo")
+    assert built["llm_kwargs"]["max_lora_rank"] == 32
+
+
+def test_the_rollout_and_training_loader_hands_it_over_too(tmp_path, monkeypatch):
+    """`grpo.load_engine` is the one `make_rollout_func` uses for all 500 steps."""
+    import protactrain.grpo as grpo
+
+    built = _stub_vllm(monkeypatch)
+    _stub_torch(monkeypatch)
+    cfg = load_config()
+    cfg["sft"]["output_dir"] = str(_adapter(tmp_path / "sft"))
+
+    engine = grpo.load_engine(cfg, grpo.Ranks())
+
+    assert engine.lora_request is not None
+    assert str(engine.lora_request.lora_path) == str(tmp_path / "sft")
+    assert built["llm_kwargs"]["max_lora_rank"] == 32
+
+
+def test_an_engine_built_for_no_adapter_carries_no_request(monkeypatch):
+    from moltrain.policy import load_engine
+
+    _stub_vllm(monkeypatch)
+    assert load_engine(load_config()).lora_request is None
+
+
+# ------------------------------------------------ what the review turned up
+
+
+def test_a_null_lora_section_is_a_config_error_not_an_attribute_error():
+    """YAML writes None for a key with nothing under it."""
+    from moltrain.policy import lora_rank
+
+    assert lora_rank({"grpo": {"lora": None}, "sft": {}}) == 16
+    assert lora_rank({"grpo": None, "sft": None}) == 16
+
+
+def test_an_interrupted_grpo_run_is_found_in_the_engines_own_copy(tmp_path):
+    """A GRPO run stopped at step 300 has nothing else on disk.
+
+    `save_steps` defaults to 500, which is the whole run as configured, so
+    there is no checkpoint-N; and `save_model` never ran. The only surviving
+    weights are the ones the sync wrote for vLLM to sample, and without this
+    the next `evaluate` silently measures the SFT policy instead.
+    """
+    root = tmp_path / "grpo"
+    _adapter(root / "_engine_rank0" / "step-300")
+    _adapter(root / "_engine_rank1" / "step-300")
+    assert latest_adapter(root) == root / "_engine_rank0" / "step-300"
+
+
+def test_a_real_checkpoint_beats_the_engines_working_copy(tmp_path):
+    root = tmp_path / "grpo"
+    _adapter(root / "checkpoint-500")
+    _adapter(root / "_engine_rank0" / "step-300")
+    assert latest_adapter(root) == root / "checkpoint-500"
+
+
+def test_the_preflight_ceiling_is_the_one_the_engine_is_given(tmp_path):
+    """check() used grpo.lora.r while load_engine passes lora_rank(cfg).
+
+    They differ the moment the warmup was trained at a higher rank, and the
+    mismatch failed a runnable config while advising a change to the rank
+    GRPO trains with -- which, in the resume path, is not used at all.
+    """
+    from moltrain.policy import lora_rank
+
+    cfg = load_config()
+    cfg["sft"]["lora"]["r"] = 64
+    cfg["grpo"]["lora"]["r"] = 32
+    assert lora_rank(cfg) == 64, "the engine would load an r=64 adapter fine"
+
+
+def test_evaluate_refuses_before_it_spends_an_arm(tmp_path):
+    """Arms run in order and nothing is written until the loop ends.
+
+    Refusing inside the loop threw away a completed `unchanged` arm -- the
+    expensive re-measurement over every drawn task -- and wrote no report.
+    """
+    from protactrain.evaluate import require_adapter
+
+    cfg = load_config()
+    cfg["grpo"]["output_dir"] = str(tmp_path / "grpo")
+    cfg["sft"]["output_dir"] = str(tmp_path / "sft")
+
+    assert require_adapter(cfg, ["unchanged"]) == "", "the control arm needs none"
+    refusal = require_adapter(cfg, ["unchanged", "policy"])
+    assert refusal
+    # The advice has to be a flag that exists.
+    assert "--arms unchanged" in refusal
+    assert str(tmp_path / "sft") in refusal
+
+    cfg["sft"]["output_dir"] = str(_adapter(tmp_path / "sft"))
+    assert require_adapter(cfg, ["policy"]) == ""

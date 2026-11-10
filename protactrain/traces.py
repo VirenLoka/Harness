@@ -390,8 +390,11 @@ async def _run(cfg: dict[str, Any], args: argparse.Namespace) -> int:
         if adapter is None:
             where = ", ".join(str(path) for path in searched)
             print(
-                f"--source model needs a trained adapter and none was found "
-                f"in {where}. Collect scripted traces first, or train one.",
+                f"--source {args.source} needs a trained adapter to sample, "
+                f"and none was found in {where} (no adapter_config.json "
+                "there, and none in any checkpoint-N/ under them). Collect "
+                "scripted traces with `--source scripted` first, or train "
+                "one.",
                 file=sys.stderr,
             )
             return 1
