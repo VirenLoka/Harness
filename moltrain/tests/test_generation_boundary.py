@@ -130,6 +130,50 @@ def test_a_tool_result_the_model_invented_is_ignored_not_counted():
     assert kept.malformed == []
 
 
+# ----------------------------------------- the markers must survive detokenizing
+#
+# The fault underneath the one above. vLLM defaults `skip_special_tokens` to
+# True, and this format is made of special tokens, so every completion came
+# back as prose with its channel structure deleted. It is also why correcting
+# STOP_STRINGS alone changed nothing: a stop string is matched against that
+# same stripped text, so `<|eom|>` could never be found in it.
+
+
+def without_special_tokens(text: str) -> str:
+    """What vLLM returns when it is left to strip them."""
+    for marker in (atem.START, atem.MESSAGE, atem.END_MESSAGE, atem.END_TURN):
+        text = text.replace(marker, "")
+    return text
+
+
+def test_a_turn_with_its_markers_removed_cannot_be_parsed_at_all():
+    """The observed failure, reproduced exactly.
+
+    Zero calls, something malformed, and no reasoning recovered -- which is
+    also why the reasoning-only warning stayed silent through it.
+    """
+    turn = generated(
+        atem.render_reasoning("Measure before editing.")
+        + atem.render_tool_call("validate_smiles", {"smiles": "CCO"})
+    )
+    blind = atem.parse_assistant_text(without_special_tokens(turn))
+    assert blind.tool_calls == []
+    assert blind.malformed
+    assert not blind.reasoning
+    assert blind.final_text is None
+
+
+def test_the_same_turn_with_its_markers_parses_perfectly():
+    """The control. Nothing is wrong with the text the model writes."""
+    turn = generated(
+        atem.render_reasoning("Measure before editing.")
+        + atem.render_tool_call("validate_smiles", {"smiles": "CCO"})
+    )
+    kept = atem.parse_assistant_text(turn)
+    assert len(kept.tool_calls) == 1
+    assert kept.malformed == []
+
+
 # ------------------------------------------------- and it must reach vLLM
 
 
@@ -147,6 +191,8 @@ def test_the_stop_strings_reach_the_sampling_params(monkeypatch):
     }
     build_sampling_params(cfg)
 
+    # The one that decides whether anything downstream can parse at all.
+    assert seen["skip_special_tokens"] is False
     assert seen["stop"] == list(STOP_STRINGS)
     assert atem.END_MESSAGE not in seen["stop"]
     # The terminator has to come back in the text: `parse_assistant_text`

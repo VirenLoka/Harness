@@ -2,6 +2,11 @@
 
 Two things here earn their keep.
 
+**The markers.** vLLM strips special tokens from its output by default, and
+this format is made of them. Without `skip_special_tokens=False` every
+completion comes back as prose with its channel structure deleted, and nothing
+downstream can parse a call out of it.
+
 **Stop strings.** Generation halts at the end of the assistant's TURN, not at
 the end of each message. The distinction is the whole of it: `<|eom|>` ends a
 *message*, and a turn is normally two of them -- reasoning, then the tool call.
@@ -221,7 +226,24 @@ class Policy:
 
 
 def build_sampling_params(cfg: dict[str, Any]) -> Any:
-    """vLLM `SamplingParams` carrying the stop strings the loop depends on."""
+    """vLLM `SamplingParams` carrying the markers and stops the loop needs.
+
+    `skip_special_tokens=False` is the load-bearing one. vLLM defaults it to
+    True, which strips exactly the tokens this format is made of --
+    `<|start|>`, `<|message|>`, `<|eom|>`, `<|eot|>` are special tokens -- so
+    every completion arrived as bare prose with the channel structure deleted.
+    `parse_assistant_text` then had nothing to match: no segment, no recipient,
+    no call. Every turn counted malformed, every episode ended at turn one with
+    `no_tool_call`, and every rollout was floored at -1.0.
+
+    It is also why the stop strings had never done anything: a stop string is
+    matched against the same detokenized text, and `<|eom|>` cannot be found in
+    output it has just been removed from. Generation ran to EOS instead, which
+    is why turns were a consistent few hundred tokens and why correcting
+    STOP_STRINGS changed nothing on its own. The two faults compound -- with
+    the markers restored, `<|eom|>` matches again and would cut every turn off
+    at the end of its reasoning, so both have to be right at once.
+    """
     from vllm import SamplingParams
 
     settings = SamplingSettings.from_config(cfg)
@@ -232,6 +254,7 @@ def build_sampling_params(cfg: dict[str, Any]) -> Any:
         max_tokens=settings.max_tokens,
         stop=list(STOP_STRINGS),
         include_stop_str_in_output=True,
+        skip_special_tokens=False,
     )
 
 
