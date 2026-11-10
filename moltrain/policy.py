@@ -34,6 +34,7 @@ and no GPU.
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -174,7 +175,28 @@ class BatchingGenerator:
         # One short wait lets the other episodes in this group enqueue their
         # turn before anything is sent to the engine.
         await asyncio.sleep(self.window_s)
-        self._flushing = False
+        try:
+            await self._drain()
+        finally:
+            # Cleared only once the queue is empty, and only here. Clearing it
+            # before the drain let a turn arriving mid-generate start a SECOND
+            # flusher, and two flushers call `engine.generate` from two worker
+            # threads at once. vLLM's offline `LLM` is not thread-safe: the
+            # calls cross, one returns another's completions ("engine returned
+            # 5 completions for 1 prompts"), and the threads wedge inside the
+            # engine -- VRAM full, GPU at nothing.
+            #
+            # Safe to clear here: between the `while` that ends the drain and
+            # this line there is no await, so no `generate` can slip in,
+            # append, see the flag still set, and be left with nobody to send
+            # it.
+            #
+            # It took multi-turn episodes to expose. While every episode ended
+            # at turn one, all of a group's turns arrived inside the same
+            # 20ms window and there was only ever one batch to flush.
+            self._flushing = False
+
+    async def _drain(self) -> None:
         while self._queue:
             batch = self._queue[: self.max_batch]
             self._queue = self._queue[self.max_batch :]
@@ -307,12 +329,19 @@ class VLLMEngine:
     def __init__(self, llm: Any, lora_request: Any = None):
         self.llm = llm
         self.lora_request = lora_request
+        # vLLM's offline `LLM` is not thread-safe, and this engine is shared by
+        # every episode in a group. `BatchingGenerator` already sends one batch
+        # at a time, but the rule belongs to the object that has it rather than
+        # to the one caller that currently respects it: entering twice does not
+        # raise, it returns one call's completions to the other.
+        self._lock = threading.Lock()
 
     def generate(self, prompts: Sequence[str], params: Any) -> list[str]:
         # Omitted rather than passed as None, so a fake engine in a test (and
         # any vLLM too old for the keyword) still sees the original signature.
         extra = {} if self.lora_request is None else {"lora_request": self.lora_request}
-        outputs = self.llm.generate(list(prompts), params, **extra)
+        with self._lock:
+            outputs = self.llm.generate(list(prompts), params, **extra)
         return [output.outputs[0].text for output in outputs]
 
 
