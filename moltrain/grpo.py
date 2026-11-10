@@ -34,7 +34,7 @@ from typing import Any
 from . import logs, progress
 from .config import ConfigError, load_config, resolve
 from .episode import Task, run_episode
-from .grpo_core import build_batch
+from .grpo_core import build_batch, index_by_prompt, recover_task_ids
 from .oracle import Oracle
 from .toolkit import Toolkit, build_toolkit
 from .traces import RecordingPolicy
@@ -141,6 +141,12 @@ def make_rollout_func(cfg: dict[str, Any], tasks_by_id: dict[str, Task]):
     toolkit = build_toolkit(cfg)
     oracle = Oracle(cfg, toolkit)
     tokenizer = AutoTokenizer.from_pretrained(cfg["model"]["name"])
+    # Before the engine: TRL hands the rollout nothing but the prompts (see
+    # `index_by_prompt`), and a collision found after the weights are loaded
+    # costs the whole load.
+    by_prompt = index_by_prompt(
+        (build_prompt(cfg, task), task_id) for task_id, task in tasks_by_id.items()
+    )
     engine = load_engine(cfg)
     params = build_sampling_params(cfg)
     num_generations = int(cfg["grpo"]["num_generations"])
@@ -152,15 +158,10 @@ def make_rollout_func(cfg: dict[str, Any], tasks_by_id: dict[str, Task]):
         # The task behind each prompt has to come from the dataset column, not
         # be guessed: GRPO's baseline is the group mean, so mis-grouping the
         # rollouts silently produces meaningless advantages. Better to stop.
-        ids = kwargs.get("task_id")
-        if not ids:
-            raise RuntimeError(
-                "rollout_func received no `task_id` column, so the rollouts "
-                "cannot be grouped by task and the advantages would be "
-                "meaningless. The train_dataset built here carries `task_id`; "
-                "check whether this TRL version forwards extra dataset "
-                "columns to rollout_func."
-            )
+        # TRL 1.17 calls this as `rollout_func(prompts, trainer)` and forwards
+        # no dataset columns, so `task_id` does not arrive and the prompt is
+        # what the task is recovered from. A TRL that forwards it is believed.
+        ids = kwargs.get("task_id") or recover_task_ids(prompts, by_prompt)
         if len(ids) != len(prompts):
             raise RuntimeError(f"{len(ids)} task ids for {len(prompts)} prompts")
         tasks = [tasks_by_id[str(task_id).split("@")[0]] for task_id in ids]

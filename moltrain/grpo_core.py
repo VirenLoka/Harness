@@ -17,7 +17,7 @@ any machine.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -136,6 +136,47 @@ def degenerate_groups(rewards: Sequence[float], num_generations: int) -> int:
     return count
 
 
+def index_by_prompt(pairs: Iterable[tuple[str, str]]) -> dict[str, str]:
+    """Map each prompt back to the task it was built from.
+
+    TRL 1.17 calls `rollout_func(prompts, trainer)` -- its own type is
+    `Callable[[list[str], GRPOTrainer], dict]` -- so a `task_id` column on the
+    train_dataset never reaches the rollout at all. The prompt text is built
+    from the task and is the only thing that does arrive, so it is what the
+    task is recovered from.
+
+    A collision is refused rather than resolved. Two tasks rendering to one
+    prompt would put their rollouts in a single group, and GRPO's baseline is
+    the group mean -- so every advantage in that group would be measured
+    against the wrong set, quietly.
+    """
+    by_prompt: dict[str, str] = {}
+    for prompt, task_id in pairs:
+        existing = by_prompt.setdefault(prompt, task_id)
+        if existing != task_id:
+            raise RolloutError(
+                f"tasks {existing!r} and {task_id!r} build the same prompt, so "
+                "a rollout cannot be attributed to either. GRPO's baseline is "
+                "the group mean, so grouping them together would make every "
+                "advantage in that group meaningless."
+            )
+    return by_prompt
+
+
+def recover_task_ids(prompts: Sequence[str], by_prompt: dict[str, str]) -> list[str]:
+    """The task id behind each prompt TRL handed to the rollout."""
+    ids = [by_prompt.get(prompt) for prompt in prompts]
+    missing = sum(1 for task_id in ids if task_id is None)
+    if missing:
+        raise RolloutError(
+            f"{missing} of {len(prompts)} prompts matched no task. The prompt "
+            "is how a rollout is attributed to its task now that TRL forwards "
+            "no dataset columns, so a prompt altered on the way through cannot "
+            "be scored against the right baseline."
+        )
+    return [str(task_id) for task_id in ids]
+
+
 @dataclass
 class RolloutBatch:
     """One GRPO step's worth of rollouts, ready to hand to a trainer."""
@@ -150,15 +191,35 @@ class RolloutBatch:
     diagnostics: dict[str, Any]
 
     def as_trl_payload(self) -> dict[str, Any]:
-        """The column layout TRL's `rollout_func` is expected to return.
+        """The column layout TRL's `rollout_func` must return.
 
-        `completion_mask` is the column that keeps environment tokens out of
-        the loss. Confirm the installed TRL honours it before training -- see
-        `python -m moltrain.grpo check`.
+        TRL 1.17 requires `prompt_ids`, `completion_ids` and `logprobs` and
+        refuses the rollout outright without all three. Every other key is an
+        "extra field", merged into the rows the reward functions are given --
+        which is how `reward` reaches `episode_reward`.
+
+        `env_mask` is the column that keeps environment tokens out of the
+        loss: 1 marks a model token, 0 marks tool output, the same convention
+        `completion_mask` has always used here. TRL pops `env_mask` out of the
+        extra fields and treats it as its tool mask. `completion_mask` is sent
+        as well because it was the name when this was written; whichever one
+        the installed TRL reads, the other costs one ignored column. Sending
+        neither means the policy is trained on text it did not write.
+
+        `logprobs` is None rather than zeros, because None is the truth. The
+        value is the SAMPLING policy's per-token logprobs, and the completion
+        here is re-encoded from an assembled multi-turn transcript, so vLLM's
+        token boundaries do not line up with these ids -- there is nothing
+        honest to put in it. TRL only reads it for the vLLM importance-sampling
+        correction and for off-policy masking, and None makes both behave as
+        though no sampling logprobs existed, which is the case. Zeros would
+        instead claim every token was sampled with probability 1.
         """
         return {
             "prompt_ids": self.prompt_ids,
             "completion_ids": self.completion_ids,
+            "logprobs": None,
+            "env_mask": self.completion_mask,
             "completion_mask": self.completion_mask,
             "reward": self.rewards,
             "task_id": self.task_ids,

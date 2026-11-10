@@ -50,7 +50,12 @@ from pathlib import Path
 from typing import Any
 
 from moltrain import logs, progress
-from moltrain.grpo_core import build_batch, degenerate_groups
+from moltrain.grpo_core import (
+    build_batch,
+    degenerate_groups,
+    index_by_prompt,
+    recover_task_ids,
+)
 
 from . import limits
 from .config import (
@@ -666,6 +671,14 @@ def make_rollout_func(cfg: dict[str, Any], tasks_by_id: dict[str, Task]):
     where = Ranks.from_env()
     toolkit = build_toolkit(cfg)
     tokenizer = AutoTokenizer.from_pretrained(cfg["model"]["name"])
+    # Before the engine, deliberately. TRL hands the rollout nothing but the
+    # prompts (see `index_by_prompt`), so this map is how a rollout finds its
+    # task -- and building it is string formatting, while a prompt collision
+    # found afterwards costs the ninety seconds it takes to load 30B of
+    # weights and capture CUDA graphs first.
+    by_prompt = index_by_prompt(
+        (build_prompt(cfg, task), task_id) for task_id, task in tasks_by_id.items()
+    )
     engine = load_engine(cfg, where)
     params = build_sampling_params(cfg)
     num_generations = int(cfg["grpo"]["num_generations"])
@@ -674,18 +687,15 @@ def make_rollout_func(cfg: dict[str, Any], tasks_by_id: dict[str, Task]):
         return tokenizer(text, add_special_tokens=False)["input_ids"]
 
     def rollout_func(prompts: list[str], *_args: Any, **kwargs: Any) -> dict[str, Any]:
-        # The task behind each prompt has to come from the dataset column, not
-        # be guessed: GRPO's baseline is the group mean, so mis-grouping the
-        # rollouts silently produces meaningless advantages. Better to stop.
-        ids = kwargs.get("task_id")
-        if not ids:
-            raise RuntimeError(
-                "rollout_func received no `task_id` column, so the rollouts "
-                "cannot be grouped by task and the advantages would be "
-                "meaningless. The train_dataset built here carries `task_id`; "
-                "check whether this TRL version forwards extra dataset "
-                "columns to rollout_func."
-            )
+        # The task behind each prompt is never guessed: GRPO's baseline is the
+        # group mean, so mis-grouping the rollouts silently produces
+        # meaningless advantages.
+        #
+        # TRL 1.17 calls this as `rollout_func(prompts, trainer)` and forwards
+        # no dataset columns at all, so `task_id` does not arrive and the
+        # prompt is what the task is recovered from. A TRL that does forward
+        # the column is still believed.
+        ids = kwargs.get("task_id") or recover_task_ids(prompts, by_prompt)
         if len(ids) != len(prompts):
             raise RuntimeError(f"{len(ids)} task ids for {len(prompts)} prompts")
         tasks = [tasks_by_id[str(task_id).split("@")[0]] for task_id in ids]
@@ -1088,14 +1098,27 @@ def check(cfg: dict[str, Any]) -> int:
             except (OSError, TypeError):
                 pass
             if source:
-                honoured = "completion_mask" in source
-                print(f"\n  completion_mask referenced in GRPOTrainer: {honoured}")
-                if not honoured:
+                # `env_mask` is the key TRL 1.17 pops out of a rollout's extra
+                # fields and uses as its tool mask. The old probe here looked
+                # for `completion_mask` instead and printed "honoured: True",
+                # which proved nothing: every TRL mentions that name for its
+                # own padding while ignoring the one the rollout returned. The
+                # payload sends both names; this reports which one is read.
+                reads = [
+                    name
+                    for name in ("env_mask", "completion_mask")
+                    if name in source
+                ]
+                print(f"\n  rollout mask names in GRPOTrainer: {', '.join(reads) or 'NEITHER'}")
+                if "env_mask" not in source:
                     problems.append(
-                        "this TRL's GRPOTrainer never mentions `completion_mask`; "
-                        "confirm environment tokens are excluded from the loss "
-                        "before training, or the policy will learn to write "
-                        "tool output itself"
+                        "this TRL's GRPOTrainer never mentions `env_mask`, the "
+                        "key it pops out of a rollout's extra fields to keep "
+                        "environment tokens out of the loss. `completion_mask` "
+                        "appearing is not evidence -- it is there for TRL's own "
+                        "padding. Confirm by hand that the mask this rollout "
+                        "returns reaches the loss, or the policy learns to "
+                        "write tool output itself."
                     )
         except Exception as exc:  # noqa: BLE001 - a check reports
             print(f"\nTRL could not be inspected: {type(exc).__name__}: {exc}")

@@ -406,6 +406,13 @@ def test_the_deterministic_expert_is_flagged_as_degenerate(cfg, toolkit, oracle)
 
 
 def test_trl_payload_carries_the_mask():
+    """Under both names, because TRL renamed the one it reads.
+
+    TRL 1.17 pops `env_mask` out of a rollout's extra fields and uses it as
+    its tool mask; `completion_mask` was the name when this was written and
+    is kept so an older TRL still finds one. Sending neither trains the
+    policy on text it did not write.
+    """
     batch = build_batch(
         [("t", [("P", "MM")], "PMMEE", 1.0)],
         lambda text: [0] * len(text),
@@ -415,11 +422,86 @@ def test_trl_payload_carries_the_mask():
     assert set(payload) == {
         "prompt_ids",
         "completion_ids",
+        "logprobs",
+        "env_mask",
         "completion_mask",
         "reward",
         "task_id",
     }
-    assert payload["completion_mask"] == [[1, 1, 0, 0]]
+    assert payload["env_mask"] == [[1, 1, 0, 0]]
+    assert payload["completion_mask"] == payload["env_mask"]
+
+
+def test_the_trl_payload_has_every_key_trl_refuses_without():
+    """TRL raises `rollout_func must return keys [...]` for any that is absent.
+
+    The check is on the key, not the value, which is why `logprobs` can be
+    None -- and None is what it should be: these completions are re-encoded
+    from an assembled multi-turn transcript, so vLLM's per-token logprobs do
+    not line up with their token boundaries. Zeros would instead tell TRL
+    every token was sampled with probability 1.
+    """
+    batch = build_batch(
+        [("t", [("P", "MM")], "PMMEE", 1.0)],
+        lambda text: [0] * len(text),
+        num_generations=1,
+    )
+    payload = batch.as_trl_payload()
+    assert {"prompt_ids", "completion_ids", "logprobs"} <= set(payload)
+    assert payload["logprobs"] is None
+
+
+# ------------------------------------------- finding the task behind a prompt
+#
+# TRL 1.17's rollout hook is `Callable[[list[str], GRPOTrainer], dict]`: it is
+# called as `rollout_func(prompts, self)` and forwards no dataset columns at
+# all, so the `task_id` column both packages put on the train_dataset never
+# arrives. The run died at step 1 on the guard that noticed.
+
+
+def test_a_prompt_finds_its_task():
+    from moltrain.grpo_core import index_by_prompt, recover_task_ids
+
+    by_prompt = index_by_prompt([("prompt A", "task-1"), ("prompt B", "task-2")])
+    assert recover_task_ids(["prompt B", "prompt A"], by_prompt) == ["task-2", "task-1"]
+
+
+def test_a_repeated_prompt_is_one_group():
+    """GRPO asks for each prompt num_generations times."""
+    from moltrain.grpo_core import index_by_prompt, recover_task_ids
+
+    by_prompt = index_by_prompt([("p", "task-1")])
+    assert recover_task_ids(["p", "p", "p"], by_prompt) == ["task-1"] * 3
+
+
+def test_the_same_task_listed_twice_is_not_a_collision():
+    from moltrain.grpo_core import index_by_prompt
+
+    assert index_by_prompt([("p", "t"), ("p", "t")]) == {"p": "t"}
+
+
+def test_two_tasks_with_one_prompt_are_refused():
+    """They would land in one group, and the baseline is the group mean.
+
+    Resolving it either way attributes half the rollouts to the wrong task
+    and measures every advantage in that group against the wrong set --
+    silently, with a loss curve that looks entirely normal.
+    """
+    from moltrain.grpo_core import RolloutError, index_by_prompt
+
+    with pytest.raises(RolloutError) as exc:
+        index_by_prompt([("p", "task-1"), ("p", "task-2")])
+    assert "task-1" in str(exc.value) and "task-2" in str(exc.value)
+
+
+def test_a_prompt_that_matches_nothing_is_refused():
+    """Better than scoring it against whichever task sorts first."""
+    from moltrain.grpo_core import RolloutError, index_by_prompt, recover_task_ids
+
+    by_prompt = index_by_prompt([("p", "t")])
+    with pytest.raises(RolloutError) as exc:
+        recover_task_ids(["p", "something else"], by_prompt)
+    assert "1 of 2" in str(exc.value)
 
 
 # ------------------------------------------------- the reward's incentives
@@ -712,3 +794,15 @@ def test_an_override_counts_as_finding_the_binary(monkeypatch):
     lines, problems = hostcheck.report_binaries(("vina",))
     assert "/opt/vina/bin/vina" in lines[0]
     assert problems == []
+
+
+def test_moltrains_rollout_recovers_its_tasks_the_same_way():
+    """The identical defect lived here too; both are fixed from one helper."""
+    import inspect
+
+    from moltrain import grpo
+
+    source = inspect.getsource(grpo.make_rollout_func)
+    assert "index_by_prompt(" in source
+    assert "recover_task_ids(" in source
+    assert source.index("index_by_prompt(") < source.index("load_engine(")

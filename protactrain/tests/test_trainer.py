@@ -80,3 +80,51 @@ def test_the_trainer_is_given_a_reward_source():
     source = inspect.getsource(grpo.train)
     assert "reward_funcs=" in source
     assert "episode_reward" in source
+
+
+# ------------------------------------------- finding the task behind a prompt
+
+
+def test_the_rollout_recovers_its_tasks_from_the_prompts():
+    """Read as source: `make_rollout_func` loads a vLLM engine.
+
+    TRL 1.17's hook is `Callable[[list[str], GRPOTrainer], dict]`, called as
+    `rollout_func(prompts, self)`. It forwards no dataset columns, so the
+    `task_id` this used to require never arrives and the run died at step 1
+    on the guard that noticed.
+    """
+    import inspect
+
+    from protactrain import grpo
+
+    source = inspect.getsource(grpo.make_rollout_func)
+    assert "index_by_prompt(" in source
+    assert "recover_task_ids(" in source
+
+
+def test_the_prompt_map_is_built_before_the_engine():
+    """A collision found afterwards costs a 30B load and a graph capture."""
+    import inspect
+
+    from protactrain import grpo
+
+    source = inspect.getsource(grpo.make_rollout_func)
+    assert source.index("index_by_prompt(") < source.index("load_engine(")
+
+
+def test_the_payload_carries_what_trl_refuses_without():
+    """`prompt_ids`, `completion_ids` and `logprobs`, or TRL rejects the dict.
+
+    Asserted here as well as in moltrain's own suite because this package is
+    the one that runs it, and the layout lives a repository away.
+    """
+    from moltrain.grpo_core import build_batch
+
+    batch = build_batch(
+        [("t", [("P", "MM")], "PMMEE", 1.0)],
+        lambda text: [0] * len(text),
+        num_generations=1,
+    )
+    payload = batch.as_trl_payload()
+    assert {"prompt_ids", "completion_ids", "logprobs"} <= set(payload)
+    assert payload["env_mask"] == [[1, 1, 0, 0]]
