@@ -647,6 +647,19 @@ async def run_episode(
             stop_reason = (
                 "final_answer" if parsed.final_text is not None else "no_tool_call"
             )
+            if stop_reason == "no_tool_call" and parsed.reasoning and not parsed.malformed:
+                # Reasoning that parsed perfectly, no call, nothing malformed.
+                # That is the shape a turn has when generation was cut off
+                # before the call was written, not when a policy chose not to
+                # act -- and it cost a whole run once, as a stop string that
+                # listed `<|eom|>` and so ended at the reasoning message.
+                LOG.warning(
+                    "%s turn %d: reasoning only -- no call and nothing "
+                    "malformed. Generation may be stopping before the call is "
+                    "emitted; check moltrain.policy.STOP_STRINGS.",
+                    task.task_id,
+                    result.n_turns,
+                )
             break
 
         terminate = False

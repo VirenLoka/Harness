@@ -2,10 +2,12 @@
 
 Two things here earn their keep.
 
-**Stop strings.** Generation has to halt at `<|eom|>` or `<|eot|>` so the
-environment can run the tool and append the result. The terminator is kept in
-the output, because `atem.parse_assistant_text` reads it to decide whether the
-turn ended.
+**Stop strings.** Generation halts at the end of the assistant's TURN, not at
+the end of each message. The distinction is the whole of it: `<|eom|>` ends a
+*message*, and a turn is normally two of them -- reasoning, then the tool call.
+Listing `<|eom|>` here stopped generation at the end of the reasoning block, so
+the call was never emitted at all. The terminator is kept in the output,
+because `atem.parse_assistant_text` reads it to decide whether the turn ended.
 
 **Batching.** GRPO samples a group of rollouts for one task, and the episode
 loop asks for one turn at a time. Left alone, eight concurrent episodes would
@@ -34,7 +36,22 @@ from typing import Any, Protocol
 from . import atem
 from .episode import Task
 
-STOP_STRINGS = (atem.END_MESSAGE, atem.END_TURN)
+# `<|eom|>` is deliberately NOT here. It ends a message, and the SFT traces
+# open every turn with a reasoning message (`experts._turn` takes the reasoning
+# as a required positional), so stopping at the first one cut every turn off
+# before its tool call. The result was an episode that parsed perfectly and
+# said nothing: 0 calls, 0 malformed, `no_tool_call`, floored -- identically on
+# every sample at temperature 1.0, because the reasoning prose varies and its
+# terminator does not.
+#
+# It only became visible once the LoRA adapter reached generation. Before that
+# the base model emitted prose that never parsed, so no rollout ever produced
+# well-formed markup for the stop string to cut.
+#
+# A tool-call turn ends with the model emitting EOS -- an SFT completion is the
+# whole turn, so that is what it was trained to do -- and vLLM halts there by
+# itself. `<|eot|>` stays, because a final answer to the user ends with it.
+STOP_STRINGS = (atem.END_TURN,)
 
 TRUNCATION_NOTE = (
     f"{atem.START}user{atem.MESSAGE}"
