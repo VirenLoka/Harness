@@ -266,9 +266,11 @@ DEFAULTS: dict[str, Any] = {
         # and moltrain's `asyncio.run()` inside the training step is not
         # rank-safe as written.
         "engine_per_rank": True,
+        # One rank on one card; the second H200 on the box is in use. The
+        # launcher plans `world_size if enabled else 1`, so both are set.
         "ddp": {
-            "enabled": True,
-            "world_size": 2,
+            "enabled": False,
+            "world_size": 1,
             "launcher": "torchrun",  # torchrun | accelerate
             "find_unused_parameters": False,
         },

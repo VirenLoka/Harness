@@ -246,9 +246,18 @@ grpo:
   # written.
   engine_per_rank: true
 
+  # One rank, on one card. The box's second H200 is in use by something else,
+  # and a second rank would land on it: `local_rank` is the device, so rank 1
+  # is device 1 whether or not device 1 is free. There is no "pick a free
+  # card" here by design -- two ranks sharing one card is worse than one rank
+  # on one card, and silently doing either would be worse still.
+  #
+  # Both knobs, because the launcher plans `world_size if enabled else 1`.
+  # Back to both cards: `enabled: true` and `world_size: 2`, or leave this
+  # alone and run `WORLD_SIZE=2 protactrain/scripts/launch_ddp.sh grpo` once.
   ddp:
-    enabled: true
-    world_size: 2
+    enabled: false
+    world_size: 1
     launcher: torchrun       # torchrun | accelerate
     find_unused_parameters: false
 

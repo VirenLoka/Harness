@@ -106,14 +106,41 @@ export PYTORCH_NVML_BASED_CUDA_CHECK="${PYTORCH_NVML_BASED_CUDA_CHECK:-1}"
 
 # ------------------------------------------------------------------- ranks
 #
-# grpo.ddp.world_size in the config is 2 and so is the default here. WORLD_SIZE
-# is read because a smoke test on one card is the first thing anyone wants:
-# `WORLD_SIZE=1 scripts/launch_ddp.sh grpo`.
-NPROC="${WORLD_SIZE:-2}"
+# The config decides the rank count; WORLD_SIZE overrides it for a one-off.
+#
+# This used to be a hardcoded `${WORLD_SIZE:-2}`, which made `grpo.ddp` in
+# the config documentation rather than configuration: setting
+# `world_size: 1` there changed nothing and the second rank started anyway
+# -- on device 1, because `local_rank` is the device, which is exactly the
+# card a single-card run is trying to stay off.
+#
+# Asked of the package rather than grepped out of the YAML, because a
+# config that omits the key still has a value through DEFAULTS, and
+# because `world_size if enabled else 1` is the rule `grpo check` already
+# plans with.
+PYTHON="${PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+  if command -v python3 >/dev/null 2>&1; then PYTHON=python3; else PYTHON=python; fi
+fi
+
+if [ -n "${WORLD_SIZE:-}" ]; then
+  NPROC="$WORLD_SIZE"
+else
+  NPROC="$(cd "$ROOT" && "$PYTHON" - "$CONFIG" <<'RANKS'
+import sys
+
+from protactrain.config import load_config
+
+ddp = load_config(sys.argv[1])["grpo"].get("ddp") or {}
+print(int(ddp.get("world_size", 1) or 1) if ddp.get("enabled") else 1)
+RANKS
+  )" || die "could not read grpo.ddp.world_size from $CONFIG"
+fi
+
 case "$NPROC" in
-  ''|*[!0-9]*) die "WORLD_SIZE must be a positive integer, not '$NPROC'" ;;
+  ''|*[!0-9]*) die "rank count must be a positive integer, not '$NPROC'" ;;
 esac
-[ "$NPROC" -ge 1 ] || die "WORLD_SIZE must be at least 1"
+[ "$NPROC" -ge 1 ] || die "rank count must be at least 1"
 
 # torchrun sets WORLD_SIZE, RANK and LOCAL_RANK in each child itself. Leaving
 # ours in the environment is how a run ends up with a rank disagreeing with
