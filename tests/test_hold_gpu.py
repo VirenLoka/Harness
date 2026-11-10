@@ -129,7 +129,7 @@ def test_asking_for_more_than_is_free_is_refused():
     look like success right up until the real job failed."""
     with pytest.raises(HoldError) as exc:
         plan(10 * GIB, "60GiB", None, CARD)
-    assert "only 10.00 GiB is free" in str(exc.value)
+    assert "only 10.00 GiB of" in str(exc.value)
 
 
 def test_saying_it_both_ways_is_refused():
@@ -241,7 +241,7 @@ def test_a_runtime_reporting_no_devices_is_refused(monkeypatch, capsys):
 
     monkeypatch.setattr(hold_gpu.CudaRuntime, "find", classmethod(lambda cls: Empty()))
     assert hold_gpu.main([]) == 2
-    assert "reports no devices" in capsys.readouterr().err
+    assert "lists no devices" in capsys.readouterr().err
 
 
 def test_a_bad_size_is_reported_before_anything_is_allocated(monkeypatch, capsys):
@@ -264,3 +264,176 @@ def test_a_bad_size_is_reported_before_anything_is_allocated(monkeypatch, capsys
     monkeypatch.setattr(hold_gpu.CudaRuntime, "find", classmethod(lambda cls: Card()))
     assert hold_gpu.main(["--size", "banana"]) == 2
     assert not taken
+
+
+# ------------------------------------- a library that loads is not one that works
+#
+# A libcudart newer than the installed driver loads perfectly and then answers
+# every call with cudaErrorInsufficientDriver (35). Committing to the first
+# .so with the right name meant exiting 2 on a box whose cards were idle,
+# blaming CUDA_VISIBLE_DEVICES, and never reaching the torch fallback that
+# would have worked -- torch carries its own libcudart of its own major.
+
+
+class FakeLib:
+    """Enough of libcudart to be loaded and probed."""
+
+    def __init__(self, status: int = 0, count: int = 2):
+        self.status = status
+        self.count = count
+        for name in (
+            "cudaGetDeviceCount",
+            "cudaSetDevice",
+            "cudaMalloc",
+            "cudaFree",
+            "cudaMemGetInfo",
+        ):
+            setattr(self, name, _Call())
+
+    def __getattr__(self, name):  # argtypes assignment on an unknown symbol
+        raise AttributeError(name)
+
+
+class _Call:
+    argtypes = None
+    restype = None
+
+    def __call__(self, *_args):
+        return 0
+
+
+def _probe_returns(monkeypatch, statuses):
+    """Load a sequence of libraries whose probes return these statuses."""
+    loaded: list[str] = []
+    queue = list(statuses)
+
+    def fake_cdll(name):
+        loaded.append(name)
+        if not queue:
+            raise OSError("no such library")
+        return FakeLib()
+
+    def fake_probe(self):
+        return queue.pop(0), 2
+
+    monkeypatch.setattr(hold_gpu.ctypes, "CDLL", fake_cdll)
+    monkeypatch.setattr(hold_gpu.CudaRuntime, "probe", fake_probe)
+    monkeypatch.setattr(hold_gpu.ctypes.util, "find_library", lambda _n: None)
+    monkeypatch.setattr(hold_gpu.os.environ, "get", lambda *a: None)
+    return loaded
+
+
+def test_a_working_library_is_taken(monkeypatch):
+    _probe_returns(monkeypatch, [0])
+    assert hold_gpu.CudaRuntime.find() is not None
+
+
+def test_a_library_that_loads_but_cannot_talk_to_the_driver_is_skipped(monkeypatch):
+    """cudaErrorInsufficientDriver is 35, not an empty device list."""
+    loaded = _probe_returns(monkeypatch, [35, 0])
+    found = hold_gpu.CudaRuntime.find()
+    assert found is not None
+    assert found.source == loaded[1]
+    assert "returned 35" in hold_gpu.CudaRuntime.rejected[0]
+
+
+def test_when_no_library_works_torch_is_still_reached(monkeypatch):
+    """The fallback the docstring promises, in the case it was written for."""
+    _probe_returns(monkeypatch, [35, 3])
+
+    class Torch:
+        def device_count(self):
+            return 2
+
+    monkeypatch.setattr(
+        hold_gpu.TorchRuntime, "find", classmethod(lambda cls: Torch())
+    )
+    assert isinstance(hold_gpu.load_runtime(), Torch)
+
+
+def test_the_refusal_names_the_libraries_it_tried(monkeypatch, capsys):
+    _probe_returns(monkeypatch, [35])
+    monkeypatch.setattr(hold_gpu.TorchRuntime, "find", classmethod(lambda cls: None))
+    assert hold_gpu.main([]) == 2
+    assert "returned 35" in capsys.readouterr().err
+
+
+# ------------------------------------------------------- the leftover release file
+
+
+def test_a_release_file_that_already_exists_is_refused(tmp_path, capsys):
+    """One successful use leaves the file behind, and the next identical run
+    would allocate, release on its first poll and hold nothing -- while
+    looking exactly like a run that worked."""
+    stale = tmp_path / "go"
+    stale.write_text("")
+    assert hold_gpu.main(["--release-file", str(stale)]) == 2
+    message = capsys.readouterr().err
+    assert str(stale) in message
+    assert "hold nothing" in message
+
+
+def test_the_stale_check_happens_before_any_cuda(tmp_path, monkeypatch, capsys):
+    """It costs nothing, and a CUDA context is not free."""
+    loaded: list[str] = []
+    monkeypatch.setattr(
+        hold_gpu.CudaRuntime,
+        "find",
+        classmethod(lambda cls: loaded.append("cuda") or None),
+    )
+    stale = tmp_path / "go"
+    stale.write_text("")
+    assert hold_gpu.main(["--release-file", str(stale)]) == 2
+    assert not loaded
+
+
+# ------------------------------------------------------------- --then and its --
+
+
+def test_everything_after_then_is_the_command():
+    head, command = hold_gpu.split_then(["--device", "0", "--then", "python", "x.py"])
+    assert head == ["--device", "0"]
+    assert command == ["python", "x.py"]
+
+
+def test_a_separator_inside_the_command_survives():
+    """argparse with REMAINDER ate the `--` and then refused the invocation,
+    blaming arguments the user believes belong to their own command."""
+    _, command = hold_gpu.split_then(
+        ["--then", "uv", "run", "--", "python", "-m", "foo", "--lr", "1e-5"]
+    )
+    assert command == ["uv", "run", "--", "python", "-m", "foo", "--lr", "1e-5"]
+
+
+def test_the_commands_own_options_are_not_this_scripts():
+    _, command = hold_gpu.split_then(["--then", "cmd", "--device", "7"])
+    assert command == ["cmd", "--device", "7"]
+
+
+def test_no_then_is_not_an_empty_command():
+    """None and [] mean different things: not asked for, versus asked for and
+    left empty."""
+    head, command = hold_gpu.split_then(["--device", "0"])
+    assert command is None
+    assert head == ["--device", "0"]
+
+
+def test_then_with_nothing_after_it_is_refused(capsys):
+    assert hold_gpu.split_then(["--then"])[1] == []
+    assert hold_gpu.main(["--then"]) == 2
+    assert "no command" in capsys.readouterr().err
+
+
+# ----------------------------------------------------------- small asks
+
+
+def test_a_target_below_the_chunk_floor_is_still_held():
+    """`--size 16MiB` held nothing and was reported as a full card."""
+    card = FakeCard(capacity=8 * GIB)
+    assert take_memory(card, 0, 16 * MIB, chunk=GIB) == 16 * MIB
+
+
+def test_the_floor_still_stops_the_halving_crawling_to_zero():
+    card = FakeCard(capacity=0)
+    take_memory(card, 0, 8 * GIB, chunk=GIB)
+    assert min(card.asked) >= MIN_CHUNK

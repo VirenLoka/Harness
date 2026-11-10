@@ -171,6 +171,10 @@ class CudaRuntime:
 
     # Where libcudart turns up when it is not on the loader path. A conda
     # environment keeps its own, and torch ships one regardless.
+    # Filled in by find() with every candidate that loaded and then failed,
+    # so the refusal can say which libraries were tried and why each lost.
+    rejected: list[str] = []
+
     NAMES = (
         "libcudart.so",
         "libcudart.so.13",
@@ -180,6 +184,7 @@ class CudaRuntime:
 
     def __init__(self, lib: Any):
         self.lib = lib
+        self.source = "?"
         self.blocks: list[tuple[int, ctypes.c_void_p]] = []
         lib.cudaGetDeviceCount.argtypes = [ctypes.POINTER(ctypes.c_int)]
         lib.cudaSetDevice.argtypes = [ctypes.c_int]
@@ -189,6 +194,20 @@ class CudaRuntime:
             ctypes.POINTER(ctypes.c_size_t),
             ctypes.POINTER(ctypes.c_size_t),
         ]
+
+    def probe(self) -> tuple[int, int]:
+        """(status, device count) from cudaGetDeviceCount, keeping the status.
+
+        The status is the whole point. A libcudart newer than the installed
+        driver loads perfectly and then answers every call with
+        cudaErrorInsufficientDriver (35), and a runtime that cannot reach the
+        driver at all answers cudaErrorInitializationError (3). Collapsing
+        either to "0 devices" reports a CUDA_VISIBLE_DEVICES problem on a box
+        whose cards are idle and whose next candidate would have worked.
+        """
+        count = ctypes.c_int(0)
+        status = self.lib.cudaGetDeviceCount(ctypes.byref(count))
+        return int(status), int(count.value)
 
     @classmethod
     def find(cls) -> CudaRuntime | None:
@@ -208,11 +227,26 @@ class CudaRuntime:
                 f"{prefix}/lib/python*/site-packages/nvidia/*/lib/libcudart*.so*",
             ):
                 candidates.extend(sorted(glob.glob(pattern), reverse=True))
+        # Each candidate is tried until one WORKS, not until one loads. There
+        # is no portable dlclose through ctypes, so a rejected library stays
+        # mapped -- which costs address space and nothing else, and is a far
+        # better trade than committing to the first .so with the right name.
+        cls.rejected = []
         for name in candidates:
             try:
-                return cls(ctypes.CDLL(name))
+                runtime = cls(ctypes.CDLL(name))
             except OSError:
                 continue
+            except AttributeError as exc:
+                # It loaded and is not libcudart: the argtypes above look the
+                # symbols up by name. Defensive rather than observed.
+                cls.rejected.append(f"{name}: not a CUDA runtime ({exc})")
+                continue
+            status, _count = runtime.probe()
+            if status == CUDA_SUCCESS:
+                runtime.source = name
+                return runtime
+            cls.rejected.append(f"{name}: cudaGetDeviceCount returned {status}")
         return None
 
     def device_count(self) -> int:
@@ -307,13 +341,18 @@ def load_runtime(prefer_torch: bool = False) -> Any:
     if runtime is None:
         runtime = TorchRuntime.find()
     if runtime is None:
+        tried = "; ".join(CudaRuntime.rejected)
         raise HoldError(
-            "no CUDA here: libcudart could not be loaded and torch reports no "
+            "no CUDA here: no usable libcudart was found and torch reports no "
             "device. This script only does something on a machine with a GPU."
+            + (f"\n  libraries tried: {tried}" if tried else "")
         )
     if runtime.device_count() < 1:
+        # Reached only once a runtime has answered cudaGetDeviceCount
+        # successfully, so this really is an empty device list rather than a
+        # driver that could not be spoken to.
         raise HoldError(
-            "the CUDA runtime loaded but reports no devices. Check "
+            "the CUDA runtime answered but lists no devices. Check "
             "CUDA_VISIBLE_DEVICES, and that nvidia-smi sees the card."
         )
     return runtime
@@ -330,9 +369,14 @@ def take_memory(runtime: Any, device: int, target: int, chunk: int = DEFAULT_CHU
     have taken some. One large request would simply fail. This holds what it
     can and reports the difference rather than pretending it got everything.
     """
+    # A target below MIN_CHUNK is still worth one allocation. The floor exists
+    # to stop the halving crawling towards zero, not to refuse a small ask --
+    # without this, `--size 16MiB` holds nothing and is then reported as a
+    # card that is already full.
+    floor = min(MIN_CHUNK, target) if target else MIN_CHUNK
     taken = 0
     size = min(chunk, target) if target else 0
-    while taken < target and size >= MIN_CHUNK:
+    while taken < target and size >= floor:
         size = min(size, target - taken)
         if runtime.take(device, size):
             taken += size
@@ -356,8 +400,11 @@ def plan(free: int, size: str | None, leave: str | None, total: int) -> int:
         wanted = parse_size(size, total)
         if wanted > free:
             raise HoldError(
-                f"asked for {human(wanted)} but only {human(free)} is free. "
-                "Something else is already holding this card."
+                f"asked for {human(wanted)} but only {human(free)} of "
+                f"{human(total)} is free. A card never has quite all of its "
+                "memory free -- the driver and any context on it hold some -- "
+                "and another process may be holding the rest. Lower --size, "
+                "or use --leave to say what to keep back instead."
             )
         return wanted
     spare = parse_size(leave, total) if leave is not None else 0
@@ -394,6 +441,25 @@ def wait_for_release(release_file: str | None, poll_s: float = 0.25) -> str:
 # ---------------------------------------------------------------------- main
 
 
+def split_then(argv: list[str]) -> tuple[list[str], list[str] | None]:
+    """Everything after `--then` is the command, taken verbatim.
+
+    argparse cannot do this. With `nargs=REMAINDER` it consumes the first
+    `--` itself and reports what follows as unrecognised, so
+    `--then uv run -- python x.py` is refused outright with a complaint about
+    arguments the user believes belong to their own command. Splitting argv
+    first means the command is passed through exactly as typed, `--` and all.
+
+    Returns (what argparse should see, the command). The command is None when
+    `--then` was not given, and `[]` when it was given with nothing after it
+    -- which is an error, not a silent no-op.
+    """
+    if "--then" not in argv:
+        return list(argv), None
+    cut = argv.index("--then")
+    return list(argv[:cut]), list(argv[cut + 1 :])
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="hold_gpu.py",
@@ -410,11 +476,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="also let go when this path appears, so another shell can hand "
         "the card over without knowing this process's pid",
     )
+    # Declared only so it appears in --help: `split_then` has already taken
+    # it and everything after it out of argv before this parser runs.
     parser.add_argument(
         "--then",
-        nargs=argparse.REMAINDER,
-        help="run this command in place of this process once the memory is "
-        "freed; everything after it is the command",
+        action="store_true",
+        help="run a command in place of this process once the memory is "
+        "freed. Everything after this flag is that command, verbatim, so its "
+        "own options and a `--` separator are passed through untouched",
     )
     parser.add_argument(
         "--chunk", default=None, help=f"allocation piece size (default: {human(DEFAULT_CHUNK)})"
@@ -428,8 +497,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    head, command = split_then(raw)
+    args = parse_args(head)
     try:
+        if command is not None and not command:
+            raise HoldError("--then was given no command to run")
+        # Before the runtime loads, because it costs nothing and because a
+        # leftover file is the difference between holding the card and
+        # holding nothing. Nothing here ever unlinks the path: a release file
+        # is operator state, and removing it would race the shell that is
+        # about to create it.
+        if args.release_file and os.path.exists(args.release_file):
+            raise HoldError(
+                f"{args.release_file} already exists, so this would release "
+                "on its first poll and hold nothing at all. Remove it first, "
+                "or name a path that does not exist yet."
+            )
         # Checked before the runtime loads: it needs nothing from the card,
         # and a typo should not cost a CUDA context first.
         if args.size is not None and args.leave is not None:
@@ -463,10 +547,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if not held:
         runtime.release()
-        print("error: nothing was held; the card is already full", file=sys.stderr)
+        print(
+            "error: nothing was held. Either the card is already full, or "
+            "--leave covered everything that was free.",
+            file=sys.stderr,
+        )
         return 1
 
-    print(f"\nholding {human(held)} across {len(devices)} device(s), pid {os.getpid()}")
+    print(
+        f"\nholding {human(held)} across {len(devices)} device(s), "
+        f"pid {os.getpid()}"
+    )
     print("release with Ctrl-C, or: kill %d" % os.getpid())
     if args.release_file:
         print(f"        or: touch {args.release_file}")
@@ -479,11 +570,8 @@ def main(argv: list[str] | None = None) -> int:
     runtime.release()
     print(f"\nreleased ({why}).")
 
-    if args.then:
-        command = [piece for piece in args.then if piece != "--"]
-        if not command:
-            print("error: --then was given no command", file=sys.stderr)
-            return 2
+    if command:
+        # No filtering: a `--` inside the command belongs to the command.
         # exec, not a subprocess: this process's CUDA context goes away with
         # its address space, and the command starts in the same pid with the
         # smallest gap this can manage.
