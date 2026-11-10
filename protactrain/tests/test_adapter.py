@@ -556,3 +556,153 @@ def test_evaluate_refuses_before_it_spends_an_arm(tmp_path):
 
     cfg["sft"]["output_dir"] = str(_adapter(tmp_path / "sft"))
     assert require_adapter(cfg, ["policy"]) == ""
+
+
+# ---------------------------------------------- which class loads the base model
+#
+# The second half of the same bug, found by the first GRPO run that got far
+# enough to resume. `AutoModelForCausalLM.from_pretrained` died on rank 1
+# with:
+#
+#     ValueError: Unrecognized configuration class MuseGlimmerConfig for this
+#     kind of AutoModel: AutoModelForCausalLM.
+#
+# Muse Glimmer is a `ForConditionalGeneration` checkpoint -- it takes images
+# as well as text -- so transformers registers its config under the
+# image-text-to-text mapping. SFT never hit it because SFTTrainer is handed
+# the model *name* and picks the class itself; only the resume path loads the
+# base model here, and only once a warmup adapter exists.
+
+
+def _fake_transformers(monkeypatch, *, architectures, exports, mappings):
+    """A transformers whose auto classes answer `in` the way the real ones do."""
+
+    class _Config:
+        def __init__(self):
+            self.architectures = list(architectures)
+
+    class _Mapping:
+        def __init__(self, members):
+            self.members = members
+
+        def __contains__(self, item):
+            return item in self.members
+
+    module = types.ModuleType("transformers")
+    config = _Config()
+    module.AutoConfig = types.SimpleNamespace(
+        from_pretrained=lambda *a, **k: config
+    )
+    for name in ("AutoModelForImageTextToText", "AutoModelForVision2Seq",
+                 "AutoModelForCausalLM"):
+        holds = mappings.get(name, ())
+        setattr(
+            module,
+            name,
+            type(name, (), {"_model_mapping": _Mapping([type(config)] if holds else [])}),
+        )
+    for name, value in exports.items():
+        setattr(module, name, value)
+    monkeypatch.setitem(sys.modules, "transformers", module)
+    return module
+
+
+def test_the_architecture_the_checkpoint_names_is_used(monkeypatch):
+    """The checkpoint is the authority on what loads it."""
+    from protactrain import grpo
+
+    named = type("MuseGlimmerForConditionalGeneration", (), {})
+    _fake_transformers(
+        monkeypatch,
+        architectures=["MuseGlimmerForConditionalGeneration"],
+        exports={"MuseGlimmerForConditionalGeneration": named},
+        mappings={"AutoModelForCausalLM": True},
+    )
+    assert grpo.base_model_class("meta-models/Muse-Glimmer-30B") is named
+
+
+def test_an_architecture_transformers_does_not_export_falls_through(monkeypatch):
+    from protactrain import grpo
+
+    module = _fake_transformers(
+        monkeypatch,
+        architectures=["SomethingNotInThisRelease"],
+        exports={},
+        mappings={"AutoModelForImageTextToText": True},
+    )
+    assert grpo.base_model_class("x") is module.AutoModelForImageTextToText
+
+
+def test_the_auto_class_is_chosen_by_which_mapping_holds_the_config(monkeypatch):
+    """Not by trying each one and loading 30B of weights to find out."""
+    from protactrain import grpo
+
+    module = _fake_transformers(
+        monkeypatch,
+        architectures=[],
+        exports={},
+        mappings={"AutoModelForCausalLM": True},
+    )
+    assert grpo.base_model_class("x") is module.AutoModelForCausalLM
+
+
+def test_image_text_to_text_is_preferred_over_causal_lm(monkeypatch):
+    """A config in both mappings is a multimodal checkpoint either way."""
+    from protactrain import grpo
+
+    module = _fake_transformers(
+        monkeypatch,
+        architectures=[],
+        exports={},
+        mappings={"AutoModelForImageTextToText": True, "AutoModelForCausalLM": True},
+    )
+    assert grpo.base_model_class("x") is module.AutoModelForImageTextToText
+
+
+def test_nothing_claiming_it_leaves_transformers_to_say_so(monkeypatch):
+    """Its message names the config and every type it does support.
+
+    Better than one invented here, which would go stale with every release.
+    """
+    from protactrain import grpo
+
+    module = _fake_transformers(
+        monkeypatch, architectures=[], exports={}, mappings={}
+    )
+    assert grpo.base_model_class("x") is module.AutoModelForCausalLM
+
+
+def test_a_mapping_that_refuses_the_question_is_skipped(monkeypatch):
+    from protactrain import grpo
+
+    module = _fake_transformers(
+        monkeypatch,
+        architectures=[],
+        exports={},
+        mappings={"AutoModelForCausalLM": True},
+    )
+
+    class _Hostile:
+        def __contains__(self, item):
+            raise TypeError("unhashable")
+
+    module.AutoModelForImageTextToText._model_mapping = _Hostile()
+    assert grpo.base_model_class("x") is module.AutoModelForCausalLM
+
+
+def test_the_resume_path_does_not_reach_for_the_causal_lm_class():
+    """Read as source, because the alternative needs a GPU.
+
+    `train` calls `require_cuda` on its first line and then imports peft, trl
+    and datasets, so reaching the resume branch in a test would mean standing
+    all of that up. This is the regression that matters -- someone putting
+    `AutoModelForCausalLM.from_pretrained` back -- and reading the one
+    function for it is honest about what is and is not being checked.
+    """
+    import inspect
+
+    from protactrain import grpo
+
+    source = inspect.getsource(grpo.train)
+    assert "AutoModelForCausalLM" not in source
+    assert "base_model_class(" in source

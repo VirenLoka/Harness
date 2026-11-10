@@ -603,6 +603,51 @@ def summarise(rollouts: list[Rollout], batch: Any, elapsed: float) -> dict[str, 
     }
 
 
+def base_model_class(name: str) -> Any:
+    """The transformers class that actually loads this checkpoint.
+
+    `AutoModelForCausalLM` is the obvious choice and the wrong one here. Muse
+    Glimmer is a `ForConditionalGeneration` checkpoint -- it takes images as
+    well as text -- so its config is registered under the image-text-to-text
+    mapping, and the causal-LM auto class refuses it with a 200-entry list of
+    model types that does not contain the one being loaded.
+
+    SFT never hit this because it hands TRL the model *name* and lets TRL pick
+    the class. The resume path is the only place this package loads the base
+    model itself, and it is reachable only once a warmup adapter exists -- so
+    this waited for the first GRPO run that got far enough to use one, which
+    is to say the first run after generation was fixed.
+
+    The checkpoint names its own architecture, so that is asked first. The
+    auto classes are the fallback, chosen by which mapping holds this config
+    rather than by loading weights to find out which one works.
+    """
+    import transformers
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(name, trust_remote_code=True)
+    for architecture in getattr(config, "architectures", None) or []:
+        found = getattr(transformers, architecture, None)
+        if found is not None:
+            return found
+    for auto in (
+        "AutoModelForImageTextToText",
+        "AutoModelForVision2Seq",
+        "AutoModelForCausalLM",
+    ):
+        candidate = getattr(transformers, auto, None)
+        mapping = getattr(candidate, "_model_mapping", None)
+        try:
+            if mapping is not None and type(config) in mapping:
+                return candidate
+        except (TypeError, KeyError):
+            continue  # a mapping that will not answer `in` is not an answer
+    # Nothing claimed it. Hand back the causal-LM class so the failure is
+    # transformers' own message -- which names the config and every type it
+    # does support -- rather than one invented here.
+    return transformers.AutoModelForCausalLM
+
+
 def make_rollout_func(cfg: dict[str, Any], tasks_by_id: dict[str, Task]):
     """TRL's `rollout_func`: generate, score, and return masked token columns.
 
@@ -956,6 +1001,14 @@ def check(cfg: dict[str, Any]) -> int:
                 "rejects an adapter above its ceiling after the weights are "
                 "already resident. Raise grpo.lora.r or sft.lora.r to match."
             )
+        # Resume is the one path that loads the base model here rather than
+        # handing TRL a name, so it is the one path that can pick the wrong
+        # class. Reading config.json is cheap; finding out at the trainer is
+        # two ranks, a torchrun and a stack trace.
+        try:
+            print(f"  loaded by: {base_model_class(cfg['model']['name']).__name__}")
+        except Exception as exc:  # noqa: BLE001 - a preflight may not reach the hub
+            print(f"  loaded by: could not resolve ({type(exc).__name__}: {exc})")
     elif wanted_adapter:
         problems.append(
             f"grpo.resume_from_sft is set but no adapter was found in {adapter} "
@@ -1244,16 +1297,16 @@ def train(cfg: dict[str, Any], *, dry_run: bool = False) -> int:
         # starting from the adapter and then passed the bare model name to the
         # trainer, so stage 2 was discarded in full every run.
         from peft import PeftModel
-        from transformers import AutoModelForCausalLM
 
-        LOG.info("loading the SFT adapter from %s", adapter)
+        loader = base_model_class(cfg["model"]["name"])
+        LOG.info("loading the SFT adapter from %s via %s", adapter, loader.__name__)
         try:
-            base = AutoModelForCausalLM.from_pretrained(
+            base = loader.from_pretrained(
                 cfg["model"]["name"], dtype="auto", trust_remote_code=True
             )
         except TypeError:
             # transformers renamed `torch_dtype` to `dtype`; accept either.
-            base = AutoModelForCausalLM.from_pretrained(
+            base = loader.from_pretrained(
                 cfg["model"]["name"], torch_dtype="auto", trust_remote_code=True
             )
         model = PeftModel.from_pretrained(base, str(adapter), is_trainable=True)
