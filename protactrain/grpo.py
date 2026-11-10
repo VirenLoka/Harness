@@ -723,6 +723,39 @@ def make_rollout_func(cfg: dict[str, Any], tasks_by_id: dict[str, Task]):
     return rollout_func
 
 
+def episode_reward(prompts=None, completions=None, **kwargs):
+    """The reward source TRL asks for, reading the score the rollout computed.
+
+    An episode's reward depends on tool results, the frozen fragments and the
+    measured baseline -- none of which can be recovered from the completion
+    text a reward function is handed. So it is computed inside `rollout_func`,
+    which returns it as a `reward` column; TRL forwards every extra column a
+    rollout_func returns to the reward functions as keyword arguments, and
+    this reads that column back.
+
+    It exists because newer TRL refuses to build the trainer at all without
+    one -- `ValueError: No reward source provided. Pass reward_funcs, or an
+    environment_factory whose environment defines a get_reward method.` Older
+    versions accepted a rollout_func carrying its own rewards and no
+    `reward_funcs`, which is why this was missing and why it surfaced only on
+    the first run that got as far as constructing the trainer.
+
+    `prompts` and `completions` are declared, unused, so the signature works
+    whether TRL passes them positionally or by keyword.
+    """
+    rewards = kwargs.get("reward")
+    if rewards is None:
+        raise RuntimeError(
+            "this TRL did not forward the rollout's `reward` column to the "
+            "reward function. The episode scores computed during the rollout "
+            "would be discarded and the advantages would mean nothing, so "
+            "this refuses rather than training on them. Check whether this "
+            "TRL version still passes a rollout_func's extra columns through "
+            "to reward_funcs."
+        )
+    return [float(reward) for reward in rewards]
+
+
 def make_engine_sync(cfg: dict[str, Any], where: Ranks, engine: Any) -> Any:
     """A TRL callback that keeps the sampling engine on the trained policy.
 
@@ -1320,6 +1353,10 @@ def train(cfg: dict[str, Any], *, dry_run: bool = False) -> int:
         train_dataset=dataset,
         peft_config=peft_config,
         rollout_func=rollout_func,
+        # Not a second opinion on the reward: `episode_reward` hands back the
+        # score the rollout already computed. TRL will not construct the
+        # trainer without a reward source even when the rollout carries one.
+        reward_funcs=[episode_reward],
     )
     # Without this the engine started above samples the policy this run began
     # with, for every one of `max_steps` steps, while the gradient is applied
